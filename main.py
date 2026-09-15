@@ -43,6 +43,7 @@ class MobileTerminalEngine:
         self.msg_seen = 0
         self.type_counts = {}
         self.ws_state = "starting"
+        self.last_reject = ""
 
         self.opens = deque(maxlen=MAX_HISTORY)
         self.highs = deque(maxlen=MAX_HISTORY)
@@ -121,6 +122,11 @@ def on_message(ws, message):
     if seen <= MSG_LOG_LIMIT:
         print(f"[WS RAW {seen}] {message[:400]}", flush=True)
 
+    # Keep the text of whatever the feed rejects, so it reaches the page too.
+    if msg_type not in ("l2_updates", "l2_orderbook"):
+        if msg_type == "error" or not mobile_pipeline.last_reject:
+            mobile_pipeline.last_reject = message[:160]
+
     if msg_type == "l2_updates":
         with mobile_pipeline.lock:
             if data.get("action") == "snapshot":
@@ -150,14 +156,14 @@ def on_message(ws, message):
 
 
 def on_open(ws):
-    channels = [
-        {"name": "l2_updates", "symbols": [SYMBOL]},
-        {"name": "l2_orderbook", "symbols": [SYMBOL]},
-    ]
-    ws.send(json.dumps({"type": "subscribe", "payload": {"channels": channels}}))
+    # Sent as separate frames: if the venue rejects one channel name, the
+    # other still gets through rather than the whole subscribe failing.
+    for name in ("l2_updates", "l2_orderbook"):
+        payload = {"type": "subscribe", "payload": {"channels": [{"name": name, "symbols": [SYMBOL]}]}}
+        ws.send(json.dumps(payload))
+        print(f"[WS] sent subscribe for {name}:{SYMBOL}", flush=True)
     mobile_pipeline.ws_state = "connected"
-    print(f"[WS] connected to {SOCKET_URL}, subscribed to "
-          f"{[c['name'] for c in channels]} for {SYMBOL}", flush=True)
+    print(f"[WS] connected to {SOCKET_URL}", flush=True)
 
 def on_error(ws, error):
     mobile_pipeline.ws_state = f"error: {type(error).__name__}: {error}"[:90]
@@ -237,11 +243,13 @@ def refresh_mobile_view(n):
         ws_state = mobile_pipeline.ws_state
         frames = mobile_pipeline.msg_seen
         type_counts = dict(mobile_pipeline.type_counts)
+        last_reject = mobile_pipeline.last_reject
 
     if not times:
         seen = ", ".join(f"{k}x{v}" for k, v in sorted(type_counts.items(), key=lambda kv: -kv[1]))
         diag = f"WS {ws_state} | frames {frames} | book {len(bids)}/{len(asks)}"
         if seen: diag += f" | {seen}"
+        if last_reject: diag += f" | {last_reject}"
         return diag, {"color": "#db8c02", "fontSize": "11px"}, go.Figure().update_layout(template="plotly_dark")
 
     last_price = cl[-1]
