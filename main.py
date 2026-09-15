@@ -20,6 +20,7 @@ SOCKET_URL = "wss://public-socket.india.delta.exchange"
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
 REFRESH_RATE_MS = 1000  # Refresh interval (1000ms = 1 second)
+MSG_LOG_LIMIT = 15      # Raw frames dumped at startup, for diagnosing the feed
 
 class MobileTerminalEngine:
     def __init__(self):
@@ -38,6 +39,10 @@ class MobileTerminalEngine:
         self.ofi_history = deque(maxlen=MAX_HISTORY)
         self.ofi_steps = deque(maxlen=MAX_HISTORY)
         
+        # Feed diagnostics
+        self.msg_seen = 0
+        self.type_counts = {}
+
         self.opens = deque(maxlen=MAX_HISTORY)
         self.highs = deque(maxlen=MAX_HISTORY)
         self.lows = deque(maxlen=MAX_HISTORY)
@@ -67,9 +72,55 @@ def apply_levels(side, levels):
         else: book[p] = s
 
 
+def update_metrics():
+    """Recompute OFI from the current top of book. Caller must hold the lock."""
+    if not (mobile_pipeline.order_book["bids"] and mobile_pipeline.order_book["asks"]):
+        return
+
+    best_bid = max(mobile_pipeline.order_book["bids"].keys())
+    best_bid_sz = mobile_pipeline.order_book["bids"][best_bid]
+    best_ask = min(mobile_pipeline.order_book["asks"].keys())
+    best_ask_sz = mobile_pipeline.order_book["asks"][best_ask]
+    
+    mid_price = (best_bid + best_ask) / 2.0
+
+    dBid = best_bid_sz if mobile_pipeline.prev_best_bid_price is None or best_bid > mobile_pipeline.prev_best_bid_price else (best_bid_sz - mobile_pipeline.prev_best_bid_size if best_bid == mobile_pipeline.prev_best_bid_price else -mobile_pipeline.prev_best_bid_size)
+    dAsk = best_ask_sz if mobile_pipeline.prev_best_ask_price is None or best_ask < mobile_pipeline.prev_best_ask_price else (best_ask_sz - mobile_pipeline.prev_best_ask_size if best_ask == mobile_pipeline.prev_best_ask_price else -mobile_pipeline.prev_best_ask_size)
+    
+    step_ofi = dBid - dAsk
+    mobile_pipeline.cumulative_ofi += step_ofi
+
+    now = pd.Timestamp.now()
+    mobile_pipeline.timestamps.append(now)
+    mobile_pipeline.prices.append(mid_price)
+    mobile_pipeline.ofi_history.append(mobile_pipeline.cumulative_ofi)
+    mobile_pipeline.ofi_steps.append(step_ofi)
+
+    mobile_pipeline.opens.append(mobile_pipeline.closes[-1] if mobile_pipeline.closes else mid_price)
+    mobile_pipeline.highs.append(max(mid_price, mobile_pipeline.opens[-1]))
+    mobile_pipeline.lows.append(min(mid_price, mobile_pipeline.opens[-1]))
+    mobile_pipeline.closes.append(mid_price)
+
+    mobile_pipeline.prev_best_bid_price = best_bid
+    mobile_pipeline.prev_best_bid_size = best_bid_sz
+    mobile_pipeline.prev_best_ask_price = best_ask
+    mobile_pipeline.prev_best_ask_size = best_ask_sz
+
+
 def on_message(ws, message):
     data = json.loads(message)
-    if data.get("type") == "l2_updates":
+    msg_type = data.get("type")
+
+    with mobile_pipeline.lock:
+        mobile_pipeline.msg_seen += 1
+        seen = mobile_pipeline.msg_seen
+        mobile_pipeline.type_counts[msg_type] = mobile_pipeline.type_counts.get(msg_type, 0) + 1
+
+    # Dump the opening frames verbatim so the real payload shape is visible in logs.
+    if seen <= MSG_LOG_LIMIT:
+        print(f"[WS RAW {seen}] {message[:400]}", flush=True)
+
+    if msg_type == "l2_updates":
         with mobile_pipeline.lock:
             if data.get("action") == "snapshot":
                 mobile_pipeline.order_book["bids"].clear()
@@ -77,41 +128,34 @@ def on_message(ws, message):
 
             apply_levels("bids", data.get("bids") or [])
             apply_levels("asks", data.get("asks") or [])
+            update_metrics()
 
-            if mobile_pipeline.order_book["bids"] and mobile_pipeline.order_book["asks"]:
-                best_bid = max(mobile_pipeline.order_book["bids"].keys())
-                best_bid_sz = mobile_pipeline.order_book["bids"][best_bid]
-                best_ask = min(mobile_pipeline.order_book["asks"].keys())
-                best_ask_sz = mobile_pipeline.order_book["asks"][best_ask]
-                
-                mid_price = (best_bid + best_ask) / 2.0
+    elif msg_type == "l2_orderbook":
+        # Full depth snapshot; Delta names the sides buy/sell on this channel.
+        with mobile_pipeline.lock:
+            mobile_pipeline.order_book["bids"].clear()
+            mobile_pipeline.order_book["asks"].clear()
 
-                dBid = best_bid_sz if mobile_pipeline.prev_best_bid_price is None or best_bid > mobile_pipeline.prev_best_bid_price else (best_bid_sz - mobile_pipeline.prev_best_bid_size if best_bid == mobile_pipeline.prev_best_bid_price else -mobile_pipeline.prev_best_bid_size)
-                dAsk = best_ask_sz if mobile_pipeline.prev_best_ask_price is None or best_ask < mobile_pipeline.prev_best_ask_price else (best_ask_sz - mobile_pipeline.prev_best_ask_size if best_ask == mobile_pipeline.prev_best_ask_price else -mobile_pipeline.prev_best_ask_size)
-                
-                step_ofi = dBid - dAsk
-                mobile_pipeline.cumulative_ofi += step_ofi
+            apply_levels("bids", data.get("buy") or data.get("bids") or [])
+            apply_levels("asks", data.get("sell") or data.get("asks") or [])
+            update_metrics()
 
-                now = pd.Timestamp.now()
-                mobile_pipeline.timestamps.append(now)
-                mobile_pipeline.prices.append(mid_price)
-                mobile_pipeline.ofi_history.append(mobile_pipeline.cumulative_ofi)
-                mobile_pipeline.ofi_steps.append(step_ofi)
+    if seen % 200 == 0:
+        with mobile_pipeline.lock:
+            print(f"[WS STATS] seen={seen} types={mobile_pipeline.type_counts} "
+                  f"bids={len(mobile_pipeline.order_book['bids'])} "
+                  f"asks={len(mobile_pipeline.order_book['asks'])} "
+                  f"points={len(mobile_pipeline.timestamps)}", flush=True)
 
-                mobile_pipeline.opens.append(mobile_pipeline.closes[-1] if mobile_pipeline.closes else mid_price)
-                mobile_pipeline.highs.append(max(mid_price, mobile_pipeline.opens[-1]))
-                mobile_pipeline.lows.append(min(mid_price, mobile_pipeline.opens[-1]))
-                mobile_pipeline.closes.append(mid_price)
-
-                mobile_pipeline.prev_best_bid_price = best_bid
-                mobile_pipeline.prev_best_bid_size = best_bid_sz
-                mobile_pipeline.prev_best_ask_price = best_ask
-                mobile_pipeline.prev_best_ask_size = best_ask_sz
 
 def on_open(ws):
-    subscribe_payload = {"type": "subscribe", "payload": {"channels": [{"name": "l2_updates", "symbols": [SYMBOL]}]}}
-    ws.send(json.dumps(subscribe_payload))
-    print(f"[WS] connected to {SOCKET_URL}, subscribed to l2_updates:{SYMBOL}", flush=True)
+    channels = [
+        {"name": "l2_updates", "symbols": [SYMBOL]},
+        {"name": "l2_orderbook", "symbols": [SYMBOL]},
+    ]
+    ws.send(json.dumps({"type": "subscribe", "payload": {"channels": channels}}))
+    print(f"[WS] connected to {SOCKET_URL}, subscribed to "
+          f"{[c['name'] for c in channels]} for {SYMBOL}", flush=True)
 
 def on_error(ws, error):
     print(f"[WS ERROR] {type(error).__name__}: {error}", flush=True)
