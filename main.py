@@ -1,5 +1,6 @@
 import json
 import os
+import urllib.request
 import threading
 import time
 from collections import deque
@@ -24,6 +25,12 @@ SOCKET_URLS = [
     "wss://public-socket.india.delta.exchange",
 ]
 STALL_SECONDS = 25      # No book data this long after connecting -> try the next URL
+
+# REST fallback. The websocket needs a channel subscription the venue can refuse;
+# this endpoint needs none, so it keeps the chart alive when the socket will not.
+REST_URL = "https://api.india.delta.exchange/v2/l2orderbook/{symbol}?depth=20"
+REST_AFTER = 10         # Seconds without websocket book data before polling REST
+REST_INTERVAL = 1.0
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
 REFRESH_RATE_MS = 1000  # Refresh interval (1000ms = 1 second)
@@ -56,6 +63,8 @@ class MobileTerminalEngine:
         self.url_index = 0
         self.connected_at = 0.0
         self.data_seen = False
+        self.last_ws_data = 0.0
+        self.rest_state = "idle"
         self.ws = None
 
         self.opens = deque(maxlen=MAX_HISTORY)
@@ -102,8 +111,6 @@ def update_metrics():
     dBid = best_bid_sz if mobile_pipeline.prev_best_bid_price is None or best_bid > mobile_pipeline.prev_best_bid_price else (best_bid_sz - mobile_pipeline.prev_best_bid_size if best_bid == mobile_pipeline.prev_best_bid_price else -mobile_pipeline.prev_best_bid_size)
     dAsk = best_ask_sz if mobile_pipeline.prev_best_ask_price is None or best_ask < mobile_pipeline.prev_best_ask_price else (best_ask_sz - mobile_pipeline.prev_best_ask_size if best_ask == mobile_pipeline.prev_best_ask_price else -mobile_pipeline.prev_best_ask_size)
     
-    mobile_pipeline.data_seen = True
-
     step_ofi = dBid - dAsk
     mobile_pipeline.cumulative_ofi += step_ofi
 
@@ -156,6 +163,8 @@ def on_message(ws, message):
             apply_levels("bids", data.get("bids") or [])
             apply_levels("asks", data.get("asks") or [])
             update_metrics()
+            mobile_pipeline.data_seen = True
+            mobile_pipeline.last_ws_data = time.time()
 
     elif msg_type == "l2_orderbook":
         # Full depth snapshot; Delta names the sides buy/sell on this channel.
@@ -166,6 +175,8 @@ def on_message(ws, message):
             apply_levels("bids", data.get("buy") or data.get("bids") or [])
             apply_levels("asks", data.get("sell") or data.get("asks") or [])
             update_metrics()
+            mobile_pipeline.data_seen = True
+            mobile_pipeline.last_ws_data = time.time()
 
     if seen % 200 == 0:
         with mobile_pipeline.lock:
@@ -193,6 +204,31 @@ def on_error(ws, error):
 def on_close(ws, status_code, msg):
     mobile_pipeline.ws_state = f"closed (code={status_code})"
     print(f"[WS CLOSED] code={status_code} msg={msg}", flush=True)
+
+
+def poll_rest():
+    """Poll the REST order book whenever the websocket is not delivering."""
+    url = REST_URL.format(symbol=SYMBOL)
+    while True:
+        time.sleep(REST_INTERVAL)
+        if time.time() - mobile_pipeline.last_ws_data < REST_AFTER:
+            continue                      # socket is healthy, leave it alone
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode())
+        except Exception as exc:
+            mobile_pipeline.rest_state = f"error: {type(exc).__name__}: {exc}"[:80]
+            continue
+
+        result = payload.get("result") or {}
+        with mobile_pipeline.lock:
+            mobile_pipeline.order_book["bids"].clear()
+            mobile_pipeline.order_book["asks"].clear()
+            apply_levels("bids", result.get("buy") or [])
+            apply_levels("asks", result.get("sell") or [])
+            update_metrics()
+        mobile_pipeline.rest_state = "ok"
 
 
 def watchdog():
@@ -234,7 +270,7 @@ def ws_forever():
 
 
 def run_ws():
-    for target in (ws_forever, watchdog):
+    for target in (ws_forever, watchdog, poll_rest):
         t = threading.Thread(target=target)
         t.daemon = True
         t.start()
@@ -288,10 +324,12 @@ def refresh_mobile_view(n):
         last_ack = mobile_pipeline.last_ack
         url_short = SOCKET_URLS[mobile_pipeline.url_index].replace("wss://", "")
         chan_status = dict(mobile_pipeline.channel_status)
+        rest_state = mobile_pipeline.rest_state
 
     if not times:
         seen = ", ".join(f"{k}x{v}" for k, v in sorted(type_counts.items(), key=lambda kv: -kv[1]))
-        diag = f"{url_short} | WS {ws_state} | frames {frames} | book {len(bids)}/{len(asks)}"
+        diag = (f"{url_short} | WS {ws_state} | REST {rest_state} "
+                f"| frames {frames} | book {len(bids)}/{len(asks)}")
         if chan_status:
             diag += " | " + ", ".join(f"{k}:{v}" for k, v in sorted(chan_status.items()))
         if seen: diag += f" | {seen}"
