@@ -35,6 +35,7 @@ SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
 REFRESH_RATE_MS = 1000  # Refresh interval (1000ms = 1 second)
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
+STALE_AFTER = 5         # Seconds without a book update before the ticker says so
 
 class MobileTerminalEngine:
     def __init__(self):
@@ -66,6 +67,7 @@ class MobileTerminalEngine:
         self.connected_at = 0.0
         self.data_seen = False
         self.last_ws_data = 0.0
+        self.last_update = 0.0          # wall clock of the last book update, any source
         self.ws = None
 
         self.opens = deque(maxlen=MAX_HISTORY)
@@ -152,6 +154,7 @@ def update_metrics():
     p.cur_low = min(p.cur_low, mid_price)
     p.cur_close = mid_price
     p.cur_ofi += step_ofi
+    p.last_update = time.time()
 
     mobile_pipeline.prev_best_bid_price = best_bid
     mobile_pipeline.prev_best_bid_size = best_bid_sz
@@ -329,6 +332,7 @@ def refresh_mobile_view(n):
             ofi_steps_list.append(mobile_pipeline.cur_ofi)
 
         ws_state = mobile_pipeline.ws_state
+        age = time.time() - mobile_pipeline.last_update if mobile_pipeline.last_update else None
 
     if not times:
         return (f"BUFFERING · {ws_state}", {"color": "#db8c02"},
@@ -337,6 +341,12 @@ def refresh_mobile_view(n):
     last_price = cl[-1]
     ticker_color = "#089981" if ofi_steps_list[-1] >= 0 else "#f23645"
     ticker_text = f"P: ${last_price:,.1f} | OFI: {current_ofi:+,.0f}"
+
+    # Without this a dead feed is indistinguishable from a quiet market: the
+    # page keeps redrawing the same last candle and looks alive.
+    if age is not None and age > STALE_AFTER:
+        ticker_text += f" | STALE {age:,.0f}s"
+        ticker_color = "#db8c02"
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, 
@@ -389,8 +399,12 @@ def refresh_mobile_view(n):
         uirevision='constant' 
     )
 
-    fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", showticklabels=False, row=1, col=1)
-    fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", tickfont=dict(size=10), row=2, col=1)
+    pad = pd.Timedelta(seconds=1)
+    xr = [times[0] - pad, times[-1] + pad]
+    fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", showticklabels=False,
+                     range=xr, row=1, col=1)
+    fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", tickfont=dict(size=10),
+                     range=xr, row=2, col=1)
     
     fig.update_yaxes(
         showgrid=True, gridcolor="#2a2e39", 
