@@ -65,8 +65,9 @@ class MobileTerminalEngine:
         self.ws_state = "starting"
         self.url_index = 0
         self.connected_at = 0.0
-        self.data_seen = False
         self.last_ws_data = 0.0
+        self.conn_started = 0.0
+        self.rest_error = ""
         self.last_update = 0.0          # wall clock of the last book update, any source
         self.ws = None
 
@@ -175,7 +176,6 @@ def on_message(ws, message):
             apply_levels("bids", data.get("bids") or [])
             apply_levels("asks", data.get("asks") or [])
             update_metrics()
-            mobile_pipeline.data_seen = True
             mobile_pipeline.last_ws_data = time.time()
 
     elif msg_type == "l2_orderbook":
@@ -187,7 +187,6 @@ def on_message(ws, message):
             apply_levels("bids", data.get("buy") or data.get("bids") or [])
             apply_levels("asks", data.get("sell") or data.get("asks") or [])
             update_metrics()
-            mobile_pipeline.data_seen = True
             mobile_pipeline.last_ws_data = time.time()
 
 
@@ -214,38 +213,46 @@ def on_close(ws, status_code, msg):
 def poll_rest():
     """Poll the REST order book whenever the websocket is not delivering."""
     url = REST_URL.format(symbol=SYMBOL)
+    headers = {"Accept": "application/json", "User-Agent": "orderflow-dashboard/1.0"}
     while True:
-        time.sleep(REST_INTERVAL)
-        if time.time() - mobile_pipeline.last_ws_data < REST_AFTER:
-            continue                      # socket is healthy, leave it alone
+        # Everything is inside the guard: this is the last line of defence, and a
+        # thread that dies here takes the fallback down for the process lifetime.
         try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            time.sleep(REST_INTERVAL)
+            if time.time() - mobile_pipeline.last_ws_data < REST_AFTER:
+                continue                  # socket is healthy, leave it alone
+
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode())
-        except Exception as exc:
-            print(f"[REST ERROR] {type(exc).__name__}: {exc}", flush=True)
-            continue
 
-        result = payload.get("result") or {}
-        with mobile_pipeline.lock:
-            mobile_pipeline.order_book["bids"].clear()
-            mobile_pipeline.order_book["asks"].clear()
-            apply_levels("bids", result.get("buy") or [])
-            apply_levels("asks", result.get("sell") or [])
-            update_metrics()
+            result = payload.get("result") or {}
+            with mobile_pipeline.lock:
+                mobile_pipeline.order_book["bids"].clear()
+                mobile_pipeline.order_book["asks"].clear()
+                apply_levels("bids", result.get("buy") or [])
+                apply_levels("asks", result.get("sell") or [])
+                update_metrics()
+            mobile_pipeline.rest_error = ""
+        except Exception as exc:
+            mobile_pipeline.rest_error = f"{type(exc).__name__}: {exc}"[:70]
+            print(f"[REST ERROR] {type(exc).__name__}: {exc}", flush=True)
 
 
 def watchdog():
-    """Abandon an endpoint that connects but never delivers book data."""
+    """Abandon an endpoint that stops delivering, whether or not it ever did."""
     while True:
-        time.sleep(5)
-        stalled = (not mobile_pipeline.data_seen
-                   and mobile_pipeline.ws_state == "connected"
-                   and time.time() - mobile_pipeline.connected_at > STALL_SECONDS)
-        if stalled and mobile_pipeline.ws is not None:
-            print(f"[WS] no data after {STALL_SECONDS}s, trying next endpoint", flush=True)
-            try: mobile_pipeline.ws.close()
-            except Exception: pass
+        try:
+            time.sleep(5)
+            last = max(mobile_pipeline.last_ws_data, mobile_pipeline.connected_at)
+            stalled = (mobile_pipeline.ws_state == "connected"
+                       and time.time() - last > STALL_SECONDS)
+            if stalled and mobile_pipeline.ws is not None:
+                print(f"[WS] silent for {STALL_SECONDS}s, dropping the connection", flush=True)
+                try: mobile_pipeline.ws.close()
+                except Exception: pass
+        except Exception as exc:
+            print(f"[WATCHDOG ERROR] {exc}", flush=True)
 
 
 def ws_forever():
@@ -261,12 +268,14 @@ def ws_forever():
             )
             mobile_pipeline.ws = ws
             mobile_pipeline.connected_at = time.time()
+            mobile_pipeline.conn_started = time.time()
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as exc:
             print(f"[WS LOOP ERROR] {exc}", flush=True)
 
-        # Nothing usable came from this endpoint; move to the next one.
-        if not mobile_pipeline.data_seen:
+        # Judge this connection alone: an endpoint that delivered before but
+        # sent nothing this time must still be rotated away from.
+        if mobile_pipeline.last_ws_data < mobile_pipeline.conn_started:
             mobile_pipeline.url_index = (mobile_pipeline.url_index + 1) % len(SOCKET_URLS)
         mobile_pipeline.ws_state = "reconnecting"
         print("[WS] reconnecting in 5s...", flush=True)
@@ -333,6 +342,7 @@ def refresh_mobile_view(n):
 
         ws_state = mobile_pipeline.ws_state
         age = time.time() - mobile_pipeline.last_update if mobile_pipeline.last_update else None
+        rest_error = mobile_pipeline.rest_error
 
     if not times:
         return (f"BUFFERING · {ws_state}", {"color": "#db8c02"},
@@ -346,6 +356,7 @@ def refresh_mobile_view(n):
     # page keeps redrawing the same last candle and looks alive.
     if age is not None and age > STALE_AFTER:
         ticker_text += f" | STALE {age:,.0f}s"
+        if rest_error: ticker_text += f" | REST {rest_error}"
         ticker_color = "#db8c02"
 
     fig = make_subplots(
