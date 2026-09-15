@@ -34,7 +34,7 @@ REST_INTERVAL = 1.0
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
 REFRESH_RATE_MS = 1000  # Refresh interval (1000ms = 1 second)
-MSG_LOG_LIMIT = 15      # Raw frames dumped at startup, for diagnosing the feed
+BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
 
 class MobileTerminalEngine:
     def __init__(self):
@@ -53,18 +53,19 @@ class MobileTerminalEngine:
         self.ofi_history = deque(maxlen=MAX_HISTORY)
         self.ofi_steps = deque(maxlen=MAX_HISTORY)
         
-        # Feed diagnostics
-        self.msg_seen = 0
-        self.type_counts = {}
+        # Candle currently being accumulated for the present second
+        self.cur_sec = None
+        self.cur_open = None
+        self.cur_high = None
+        self.cur_low = None
+        self.cur_close = None
+        self.cur_ofi = 0.0
+
         self.ws_state = "starting"
-        self.last_reject = ""
-        self.last_ack = ""
-        self.channel_status = {}
         self.url_index = 0
         self.connected_at = 0.0
         self.data_seen = False
         self.last_ws_data = 0.0
-        self.rest_state = "idle"
         self.ws = None
 
         self.opens = deque(maxlen=MAX_HISTORY)
@@ -96,6 +97,21 @@ def apply_levels(side, levels):
         else: book[p] = s
 
 
+def flush_bucket():
+    """Close the accumulating second and push it onto the history. Lock held."""
+    p = mobile_pipeline
+    if p.cur_sec is None or p.cur_close is None:
+        return
+    p.timestamps.append(p.cur_sec)
+    p.opens.append(p.cur_open)
+    p.highs.append(p.cur_high)
+    p.lows.append(p.cur_low)
+    p.closes.append(p.cur_close)
+    p.prices.append(p.cur_close)
+    p.ofi_steps.append(p.cur_ofi)
+    p.ofi_history.append(p.cumulative_ofi)
+
+
 def update_metrics():
     """Recompute OFI from the current top of book. Caller must hold the lock."""
     if not (mobile_pipeline.order_book["bids"] and mobile_pipeline.order_book["asks"]):
@@ -114,16 +130,28 @@ def update_metrics():
     step_ofi = dBid - dAsk
     mobile_pipeline.cumulative_ofi += step_ofi
 
-    now = pd.Timestamp.now()
-    mobile_pipeline.timestamps.append(now)
-    mobile_pipeline.prices.append(mid_price)
-    mobile_pipeline.ofi_history.append(mobile_pipeline.cumulative_ofi)
-    mobile_pipeline.ofi_steps.append(step_ofi)
+    # Fold this update into the current second rather than emitting a point per
+    # message: the feed bursts many updates per second, which collapses the
+    # timeline to milliseconds and makes every candle degenerate.
+    sec = pd.Timestamp.now().floor(BUCKET)
+    p = mobile_pipeline
 
-    mobile_pipeline.opens.append(mobile_pipeline.closes[-1] if mobile_pipeline.closes else mid_price)
-    mobile_pipeline.highs.append(max(mid_price, mobile_pipeline.opens[-1]))
-    mobile_pipeline.lows.append(min(mid_price, mobile_pipeline.opens[-1]))
-    mobile_pipeline.closes.append(mid_price)
+    if p.cur_sec is None:
+        p.cur_sec = sec
+        p.cur_open = p.closes[-1] if p.closes else mid_price
+        p.cur_high = p.cur_low = mid_price
+        p.cur_ofi = 0.0
+    elif sec != p.cur_sec:
+        flush_bucket()
+        p.cur_sec = sec
+        p.cur_open = p.cur_close
+        p.cur_high = p.cur_low = mid_price
+        p.cur_ofi = 0.0
+
+    p.cur_high = max(p.cur_high, mid_price)
+    p.cur_low = min(p.cur_low, mid_price)
+    p.cur_close = mid_price
+    p.cur_ofi += step_ofi
 
     mobile_pipeline.prev_best_bid_price = best_bid
     mobile_pipeline.prev_best_bid_size = best_bid_sz
@@ -134,25 +162,6 @@ def update_metrics():
 def on_message(ws, message):
     data = json.loads(message)
     msg_type = data.get("type")
-
-    with mobile_pipeline.lock:
-        mobile_pipeline.msg_seen += 1
-        seen = mobile_pipeline.msg_seen
-        mobile_pipeline.type_counts[msg_type] = mobile_pipeline.type_counts.get(msg_type, 0) + 1
-
-    # Dump the opening frames verbatim so the real payload shape is visible in logs.
-    if seen <= MSG_LOG_LIMIT:
-        print(f"[WS RAW {seen}] {message[:400]}", flush=True)
-
-    # Keep what the feed accepted and what it rejected, so both reach the page.
-    if msg_type == "subscriptions":
-        mobile_pipeline.last_ack = message[:200]
-        for ch in (data.get("channels") or []):
-            if isinstance(ch, dict) and ch.get("name"):
-                mobile_pipeline.channel_status[ch["name"]] = "ok" if not ch.get("error") else "forbidden"
-    elif msg_type not in ("l2_updates", "l2_orderbook", "v2/ticker"):
-        if msg_type == "error" or not mobile_pipeline.last_reject:
-            mobile_pipeline.last_reject = message[:160]
 
     if msg_type == "l2_updates":
         with mobile_pipeline.lock:
@@ -178,18 +187,11 @@ def on_message(ws, message):
             mobile_pipeline.data_seen = True
             mobile_pipeline.last_ws_data = time.time()
 
-    if seen % 200 == 0:
-        with mobile_pipeline.lock:
-            print(f"[WS STATS] seen={seen} types={mobile_pipeline.type_counts} "
-                  f"bids={len(mobile_pipeline.order_book['bids'])} "
-                  f"asks={len(mobile_pipeline.order_book['asks'])} "
-                  f"points={len(mobile_pipeline.timestamps)}", flush=True)
-
 
 def on_open(ws):
     # Sent as separate frames: if the venue rejects one channel name, the
     # other still gets through rather than the whole subscribe failing.
-    for name in ("l2_updates", "l2_orderbook", "v2/ticker"):
+    for name in ("l2_updates", "l2_orderbook"):
         payload = {"type": "subscribe", "payload": {"channels": [{"name": name, "symbols": [SYMBOL]}]}}
         ws.send(json.dumps(payload))
         print(f"[WS] sent subscribe for {name}:{SYMBOL}", flush=True)
@@ -218,7 +220,7 @@ def poll_rest():
             with urllib.request.urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode())
         except Exception as exc:
-            mobile_pipeline.rest_state = f"error: {type(exc).__name__}: {exc}"[:80]
+            print(f"[REST ERROR] {type(exc).__name__}: {exc}", flush=True)
             continue
 
         result = payload.get("result") or {}
@@ -228,7 +230,6 @@ def poll_rest():
             apply_levels("bids", result.get("buy") or [])
             apply_levels("asks", result.get("sell") or [])
             update_metrics()
-        mobile_pipeline.rest_state = "ok"
 
 
 def watchdog():
@@ -317,24 +318,21 @@ def refresh_mobile_view(n):
         op, hi, lo, cl = list(mobile_pipeline.opens), list(mobile_pipeline.highs), list(mobile_pipeline.lows), list(mobile_pipeline.closes)
         ofi_steps_list = list(mobile_pipeline.ofi_steps)
 
+        # Include the second still being accumulated, so the newest candle grows
+        # live instead of appearing only once the second has closed.
+        if mobile_pipeline.cur_sec is not None and mobile_pipeline.cur_close is not None:
+            times.append(mobile_pipeline.cur_sec)
+            op.append(mobile_pipeline.cur_open)
+            hi.append(mobile_pipeline.cur_high)
+            lo.append(mobile_pipeline.cur_low)
+            cl.append(mobile_pipeline.cur_close)
+            ofi_steps_list.append(mobile_pipeline.cur_ofi)
+
         ws_state = mobile_pipeline.ws_state
-        frames = mobile_pipeline.msg_seen
-        type_counts = dict(mobile_pipeline.type_counts)
-        last_reject = mobile_pipeline.last_reject
-        last_ack = mobile_pipeline.last_ack
-        url_short = SOCKET_URLS[mobile_pipeline.url_index].replace("wss://", "")
-        chan_status = dict(mobile_pipeline.channel_status)
-        rest_state = mobile_pipeline.rest_state
 
     if not times:
-        seen = ", ".join(f"{k}x{v}" for k, v in sorted(type_counts.items(), key=lambda kv: -kv[1]))
-        diag = (f"{url_short} | WS {ws_state} | REST {rest_state} "
-                f"| frames {frames} | book {len(bids)}/{len(asks)}")
-        if chan_status:
-            diag += " | " + ", ".join(f"{k}:{v}" for k, v in sorted(chan_status.items()))
-        if seen: diag += f" | {seen}"
-        if last_reject: diag += f" | ERR {last_reject}"
-        return diag, {"color": "#db8c02", "fontSize": "11px"}, go.Figure().update_layout(template="plotly_dark")
+        return (f"BUFFERING · {ws_state}", {"color": "#db8c02"},
+                go.Figure().update_layout(template="plotly_dark"))
 
     last_price = cl[-1]
     ticker_color = "#089981" if ofi_steps_list[-1] >= 0 else "#f23645"
