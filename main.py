@@ -301,13 +301,32 @@ def ws_forever():
         time.sleep(5)
 
 
-def run_ws():
-    for target in (ws_forever, watchdog, poll_rest):
-        t = threading.Thread(target=target)
-        t.daemon = True
-        t.start()
+WORKERS = (("ws", ws_forever), ("watchdog", watchdog), ("rest", poll_rest))
+_threads = {}
+_threads_lock = threading.Lock()
 
-run_ws()
+
+def ensure_workers():
+    """Start the feed threads in THIS process, and restart any that have died.
+
+    Threads do not survive fork(). Under `gunicorn --preload` the module is
+    imported once in the master and the workers are forked from it, so threads
+    started at import exist only in the master: every worker then serves the
+    snapshot captured at fork time and never updates again. Calling this from
+    the callback as well as at import means whichever process answers requests
+    is always the one running the feed.
+    """
+    with _threads_lock:
+        for name, target in WORKERS:
+            t = _threads.get(name)
+            if t is None or not t.is_alive():
+                t = threading.Thread(target=target, name=name, daemon=True)
+                t.start()
+                _threads[name] = t
+                print(f"[THREADS] started {name} in pid {os.getpid()}", flush=True)
+
+
+ensure_workers()
 
 # =====================================================================
 # DASH PRESENTATION CONTAINER SETUP
@@ -417,6 +436,8 @@ def dom_table(bids, asks):
     [Input("mobile-pulse-clock", "n_intervals")]
 )
 def refresh_mobile_view(n):
+    ensure_workers()        # a forked worker starts its own feed on first request
+
     with mobile_pipeline.lock:
         bids = dict(mobile_pipeline.order_book["bids"])
         asks = dict(mobile_pipeline.order_book["asks"])
