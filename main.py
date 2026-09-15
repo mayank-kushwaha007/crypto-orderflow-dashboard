@@ -42,6 +42,7 @@ class MobileTerminalEngine:
         # Feed diagnostics
         self.msg_seen = 0
         self.type_counts = {}
+        self.ws_state = "starting"
 
         self.opens = deque(maxlen=MAX_HISTORY)
         self.highs = deque(maxlen=MAX_HISTORY)
@@ -154,14 +155,17 @@ def on_open(ws):
         {"name": "l2_orderbook", "symbols": [SYMBOL]},
     ]
     ws.send(json.dumps({"type": "subscribe", "payload": {"channels": channels}}))
+    mobile_pipeline.ws_state = "connected"
     print(f"[WS] connected to {SOCKET_URL}, subscribed to "
           f"{[c['name'] for c in channels]} for {SYMBOL}", flush=True)
 
 def on_error(ws, error):
+    mobile_pipeline.ws_state = f"error: {type(error).__name__}: {error}"[:90]
     print(f"[WS ERROR] {type(error).__name__}: {error}", flush=True)
 
 
 def on_close(ws, status_code, msg):
+    mobile_pipeline.ws_state = f"closed (code={status_code})"
     print(f"[WS CLOSED] code={status_code} msg={msg}", flush=True)
 
 
@@ -178,6 +182,7 @@ def ws_forever():
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as exc:
             print(f"[WS LOOP ERROR] {exc}", flush=True)
+        mobile_pipeline.ws_state = "reconnecting"
         print("[WS] reconnecting in 5s...", flush=True)
         time.sleep(5)
 
@@ -229,8 +234,15 @@ def refresh_mobile_view(n):
         op, hi, lo, cl = list(mobile_pipeline.opens), list(mobile_pipeline.highs), list(mobile_pipeline.lows), list(mobile_pipeline.closes)
         ofi_steps_list = list(mobile_pipeline.ofi_steps)
 
+        ws_state = mobile_pipeline.ws_state
+        frames = mobile_pipeline.msg_seen
+        type_counts = dict(mobile_pipeline.type_counts)
+
     if not times:
-        return "BUFFERING ENGINE...", {"color": "#db8c02"}, go.Figure().update_layout(template="plotly_dark")
+        seen = ", ".join(f"{k}x{v}" for k, v in sorted(type_counts.items(), key=lambda kv: -kv[1]))
+        diag = f"WS {ws_state} | frames {frames} | book {len(bids)}/{len(asks)}"
+        if seen: diag += f" | {seen}"
+        return diag, {"color": "#db8c02", "fontSize": "11px"}, go.Figure().update_layout(template="plotly_dark")
 
     last_price = cl[-1]
     ticker_color = "#089981" if ofi_steps_list[-1] >= 0 else "#f23645"
