@@ -44,6 +44,7 @@ class MobileTerminalEngine:
         self.type_counts = {}
         self.ws_state = "starting"
         self.last_reject = ""
+        self.last_ack = ""
 
         self.opens = deque(maxlen=MAX_HISTORY)
         self.highs = deque(maxlen=MAX_HISTORY)
@@ -122,8 +123,10 @@ def on_message(ws, message):
     if seen <= MSG_LOG_LIMIT:
         print(f"[WS RAW {seen}] {message[:400]}", flush=True)
 
-    # Keep the text of whatever the feed rejects, so it reaches the page too.
-    if msg_type not in ("l2_updates", "l2_orderbook"):
+    # Keep what the feed accepted and what it rejected, so both reach the page.
+    if msg_type == "subscriptions":
+        mobile_pipeline.last_ack = message[:200]
+    elif msg_type not in ("l2_updates", "l2_orderbook", "v2/ticker"):
         if msg_type == "error" or not mobile_pipeline.last_reject:
             mobile_pipeline.last_reject = message[:160]
 
@@ -158,7 +161,7 @@ def on_message(ws, message):
 def on_open(ws):
     # Sent as separate frames: if the venue rejects one channel name, the
     # other still gets through rather than the whole subscribe failing.
-    for name in ("l2_updates", "l2_orderbook"):
+    for name in ("l2_updates", "l2_orderbook", "v2/ticker"):
         payload = {"type": "subscribe", "payload": {"channels": [{"name": name, "symbols": [SYMBOL]}]}}
         ws.send(json.dumps(payload))
         print(f"[WS] sent subscribe for {name}:{SYMBOL}", flush=True)
@@ -244,12 +247,14 @@ def refresh_mobile_view(n):
         frames = mobile_pipeline.msg_seen
         type_counts = dict(mobile_pipeline.type_counts)
         last_reject = mobile_pipeline.last_reject
+        last_ack = mobile_pipeline.last_ack
 
     if not times:
         seen = ", ".join(f"{k}x{v}" for k, v in sorted(type_counts.items(), key=lambda kv: -kv[1]))
         diag = f"WS {ws_state} | frames {frames} | book {len(bids)}/{len(asks)}"
         if seen: diag += f" | {seen}"
-        if last_reject: diag += f" | {last_reject}"
+        if last_ack: diag += f" | ACK {last_ack}"
+        if last_reject: diag += f" | ERR {last_reject}"
         return diag, {"color": "#db8c02", "fontSize": "11px"}, go.Figure().update_layout(template="plotly_dark")
 
     last_price = cl[-1]
