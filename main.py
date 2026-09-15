@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 from collections import deque
@@ -47,19 +48,35 @@ mobile_pipeline = MobileTerminalEngine()
 # =====================================================================
 # BACKGROUND DATA INGESTION MATRIX
 # =====================================================================
+def parse_level(level):
+    """Delta sends a level either as ["price", "size"] or as
+    {"limit_price": "...", "size": ...}. Handle both, return (price, size)."""
+    if isinstance(level, dict):
+        return float(level.get("limit_price", level.get("price"))), float(level.get("size", 0))
+    return float(level[0]), float(level[1])
+
+
+def apply_levels(side, levels):
+    book = mobile_pipeline.order_book[side]
+    for level in levels:
+        try:
+            p, s = parse_level(level)
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        if s == 0: book.pop(p, None)
+        else: book[p] = s
+
+
 def on_message(ws, message):
     data = json.loads(message)
-    if "type" in data and data["type"] == "l2_updates" and "bids" in data:
+    if data.get("type") == "l2_updates":
         with mobile_pipeline.lock:
-            for bid in data.get("bids", []):
-                p, s = float(bid), float(bid)
-                if s == 0: mobile_pipeline.order_book["bids"].pop(p, None)
-                else: mobile_pipeline.order_book["bids"][p] = s
+            if data.get("action") == "snapshot":
+                mobile_pipeline.order_book["bids"].clear()
+                mobile_pipeline.order_book["asks"].clear()
 
-            for ask in data.get("asks", []):
-                p, s = float(ask), float(ask)
-                if s == 0: mobile_pipeline.order_book["asks"].pop(p, None)
-                else: mobile_pipeline.order_book["asks"][p] = s
+            apply_levels("bids", data.get("bids") or [])
+            apply_levels("asks", data.get("asks") or [])
 
             if mobile_pipeline.order_book["bids"] and mobile_pipeline.order_book["asks"]:
                 best_bid = max(mobile_pipeline.order_book["bids"].keys())
@@ -94,10 +111,35 @@ def on_message(ws, message):
 def on_open(ws):
     subscribe_payload = {"type": "subscribe", "payload": {"channels": [{"name": "l2_updates", "symbols": [SYMBOL]}]}}
     ws.send(json.dumps(subscribe_payload))
+    print(f"[WS] connected to {SOCKET_URL}, subscribed to l2_updates:{SYMBOL}", flush=True)
+
+def on_error(ws, error):
+    print(f"[WS ERROR] {type(error).__name__}: {error}", flush=True)
+
+
+def on_close(ws, status_code, msg):
+    print(f"[WS CLOSED] code={status_code} msg={msg}", flush=True)
+
+
+def ws_forever():
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                SOCKET_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as exc:
+            print(f"[WS LOOP ERROR] {exc}", flush=True)
+        print("[WS] reconnecting in 5s...", flush=True)
+        time.sleep(5)
+
 
 def run_ws():
-    ws = websocket.WebSocketApp(SOCKET_URL, on_open=on_open, on_message=on_message)
-    wst = threading.Thread(target=ws.run_forever)
+    wst = threading.Thread(target=ws_forever)
     wst.daemon = True
     wst.start()
 
@@ -163,8 +205,8 @@ def refresh_mobile_view(n):
     ), row=1, col=1)
 
     if bids and asks:
-        sorted_bids = sorted(bids.items(), key=lambda x: x, reverse=True)[:8]
-        sorted_asks = sorted(asks.items(), key=lambda x: x)[:8]
+        sorted_bids = sorted(bids.items(), key=lambda x: x[0], reverse=True)[:8]
+        sorted_asks = sorted(asks.items(), key=lambda x: x[0])[:8]
         
         max_size = max([s for p, s in sorted_bids + sorted_asks] + [1.0])
         
@@ -221,4 +263,4 @@ def refresh_mobile_view(n):
 # CLOUD PRODUCTION SERVICE DEPLOYMENT RUN ENGINE
 # =====================================================================
 if __name__ == "__main__":
-    app.run_server(debug=False, host="0.0.0.0", port=8050)
+    app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 8050)))
