@@ -29,8 +29,9 @@ STALL_SECONDS = 25      # No book data this long after connecting -> try the nex
 # REST fallback. The websocket needs a channel subscription the venue can refuse;
 # this endpoint needs none, so it keeps the chart alive when the socket will not.
 REST_URL = "https://api.india.delta.exchange/v2/l2orderbook/{symbol}?depth=20"
-REST_AFTER = 10         # Seconds without websocket book data before polling REST
-REST_INTERVAL = 1.0
+TICKER_URL = "https://api.india.delta.exchange/v2/tickers/{symbol}"
+REST_INTERVAL = 1.0     # REST is the primary source: polled every second, always
+DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
 REFRESH_RATE_MS = 1000  # Refresh interval (1000ms = 1 second)
@@ -68,6 +69,8 @@ class MobileTerminalEngine:
         self.last_ws_data = 0.0
         self.conn_started = 0.0
         self.rest_error = ""
+        self.ltp = None                 # last traded price, from the ticker endpoint
+        self.prev_ltp = None
         self.last_update = 0.0          # wall clock of the last book update, any source
         self.ws = None
 
@@ -210,6 +213,23 @@ def on_close(ws, status_code, msg):
     print(f"[WS CLOSED] code={status_code} msg={msg}", flush=True)
 
 
+def fetch_ltp(headers):
+    """Last traded price. Independent of the book, so it survives book failures."""
+    try:
+        req = urllib.request.Request(TICKER_URL.format(symbol=SYMBOL), headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = (json.loads(resp.read().decode()).get("result") or {})
+        for key in ("close", "last_price", "mark_price", "spot_price"):
+            if result.get(key) not in (None, ""):
+                ltp = float(result[key])
+                if ltp != mobile_pipeline.ltp:
+                    mobile_pipeline.prev_ltp = mobile_pipeline.ltp
+                mobile_pipeline.ltp = ltp
+                return
+    except Exception as exc:
+        print(f"[LTP ERROR] {type(exc).__name__}: {exc}", flush=True)
+
+
 def poll_rest():
     """Poll the REST order book whenever the websocket is not delivering."""
     url = REST_URL.format(symbol=SYMBOL)
@@ -219,8 +239,7 @@ def poll_rest():
         # thread that dies here takes the fallback down for the process lifetime.
         try:
             time.sleep(REST_INTERVAL)
-            if time.time() - mobile_pipeline.last_ws_data < REST_AFTER:
-                continue                  # socket is healthy, leave it alone
+            fetch_ltp(headers)
 
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -306,7 +325,20 @@ app.layout = html.Div(
                 html.Div(id="mobile-ticker-feed", style={"fontWeight": "bold"})
             ]
         ),
+        html.Div(
+            style={"display": "flex", "alignItems": "baseline", "gap": "10px",
+                   "padding": "10px 8px 6px"},
+            children=[
+                html.Span("LTP", style={"color": "#787b86", "fontSize": "11px",
+                                        "letterSpacing": "0.08em"}),
+                html.Span(id="ltp-value", style={"fontSize": "28px", "fontWeight": "bold",
+                                                 "fontVariantNumeric": "tabular-nums"}),
+                html.Span(id="ltp-delta", style={"fontSize": "12px",
+                                                 "fontVariantNumeric": "tabular-nums"}),
+            ]
+        ),
         dcc.Graph(id="mobile-master-chart", config={"displayModeBar": False, "scrollZoom": True}),
+        html.Div(id="dom-table", style={"padding": "4px 8px 12px"}),
         dcc.Interval(id="mobile-pulse-clock", interval=REFRESH_RATE_MS, n_intervals=0)
     ]
 )
@@ -314,10 +346,74 @@ app.layout = html.Div(
 # =====================================================================
 # RENDERING PIPELINE CONTROLLER CALLBACK
 # =====================================================================
+CELL = {"padding": "3px 10px", "fontVariantNumeric": "tabular-nums",
+        "fontFamily": "ui-monospace, Menlo, monospace", "fontSize": "12px"}
+HEAD = dict(CELL, color="#787b86", fontSize="10px", letterSpacing="0.06em",
+            borderBottom="1px solid #2a2e39", textAlign="right")
+
+
+def format_ltp(ltp, prev_ltp):
+    """Big traded price, tinted and signed against the previous print."""
+    base = {"fontSize": "28px", "fontWeight": "bold", "fontVariantNumeric": "tabular-nums"}
+    if ltp is None:
+        return "—", dict(base, color="#787b86"), ""
+    if prev_ltp is None or ltp == prev_ltp:
+        return f"${ltp:,.1f}", dict(base, color="#d1d4dc"), ""
+    up = ltp > prev_ltp
+    diff = ltp - prev_ltp
+    colour = "#089981" if up else "#f23645"
+    return (f"${ltp:,.1f}", dict(base, color=colour),
+            html.Span(f"{'▲' if up else '▼'} {abs(diff):,.1f}", style={"color": colour}))
+
+
+def dom_table(bids, asks):
+    """Bid and ask ladders side by side, deepest liquidity shaded strongest."""
+    top_bids = sorted(bids.items(), key=lambda x: x[0], reverse=True)[:DOM_ROWS]
+    top_asks = sorted(asks.items(), key=lambda x: x[0])[:DOM_ROWS]
+    if not top_bids and not top_asks:
+        return None
+
+    biggest = max([sz for _, sz in top_bids + top_asks] + [1.0])
+    rows = []
+    for i in range(max(len(top_bids), len(top_asks))):
+        bp, bs = top_bids[i] if i < len(top_bids) else ("", "")
+        ap, asz = top_asks[i] if i < len(top_asks) else ("", "")
+        b_shade = f"rgba(8,153,129,{0.06 + 0.34 * (bs / biggest):.3f})" if bs != "" else "transparent"
+        a_shade = f"rgba(242,54,69,{0.06 + 0.34 * (asz / biggest):.3f})" if asz != "" else "transparent"
+        rows.append(html.Tr([
+            html.Td(f"{bs:,.0f}" if bs != "" else "",
+                    style=dict(CELL, textAlign="right", color="#9fb0ad", backgroundColor=b_shade)),
+            html.Td(f"{bp:,.1f}" if bp != "" else "",
+                    style=dict(CELL, textAlign="right", color="#089981", fontWeight="bold",
+                               backgroundColor=b_shade)),
+            html.Td(f"{ap:,.1f}" if ap != "" else "",
+                    style=dict(CELL, textAlign="left", color="#f23645", fontWeight="bold",
+                               backgroundColor=a_shade)),
+            html.Td(f"{asz:,.0f}" if asz != "" else "",
+                    style=dict(CELL, textAlign="left", color="#c2a0a3", backgroundColor=a_shade)),
+        ]))
+
+    return html.Table(
+        style={"width": "100%", "borderCollapse": "collapse", "tableLayout": "fixed"},
+        children=[
+            html.Thead(html.Tr([
+                html.Th("BID SIZE", style=HEAD),
+                html.Th("BID", style=HEAD),
+                html.Th("ASK", style=dict(HEAD, textAlign="left")),
+                html.Th("ASK SIZE", style=dict(HEAD, textAlign="left")),
+            ])),
+            html.Tbody(rows),
+        ])
+
+
 @app.callback(
     [Output("mobile-ticker-feed", "children"),
      Output("mobile-ticker-feed", "style"),
-     Output("mobile-master-chart", "figure")],
+     Output("mobile-master-chart", "figure"),
+     Output("ltp-value", "children"),
+     Output("ltp-value", "style"),
+     Output("ltp-delta", "children"),
+     Output("dom-table", "children")],
     [Input("mobile-pulse-clock", "n_intervals")]
 )
 def refresh_mobile_view(n):
@@ -343,10 +439,15 @@ def refresh_mobile_view(n):
         ws_state = mobile_pipeline.ws_state
         age = time.time() - mobile_pipeline.last_update if mobile_pipeline.last_update else None
         rest_error = mobile_pipeline.rest_error
+        ltp, prev_ltp = mobile_pipeline.ltp, mobile_pipeline.prev_ltp
+
+    ltp_text, ltp_style, ltp_delta = format_ltp(ltp, prev_ltp)
+    table = dom_table(bids, asks)
 
     if not times:
         return (f"BUFFERING · {ws_state}", {"color": "#db8c02"},
-                go.Figure().update_layout(template="plotly_dark"))
+                go.Figure().update_layout(template="plotly_dark"),
+                ltp_text, ltp_style, ltp_delta, table)
 
     last_price = cl[-1]
     ticker_color = "#089981" if ofi_steps_list[-1] >= 0 else "#f23645"
@@ -428,7 +529,8 @@ def refresh_mobile_view(n):
         autorange=True, row=2, col=1
     )
 
-    return ticker_text, {"color": ticker_color}, fig
+    return (ticker_text, {"color": ticker_color}, fig,
+            ltp_text, ltp_style, ltp_delta, table)
 
 # =====================================================================
 # CLOUD PRODUCTION SERVICE DEPLOYMENT RUN ENGINE
