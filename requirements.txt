@@ -1,0 +1,6 @@
+dash
+plotly
+websocket-client
+pandas
+numpy
+gunicorn
