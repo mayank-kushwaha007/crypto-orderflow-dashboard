@@ -16,7 +16,14 @@ from plotly.subplots import make_subplots
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
-SOCKET_URL = "wss://public-socket.india.delta.exchange" 
+# Tried in order. A connection that yields no book data is abandoned for the
+# next one, so a wrong endpoint self-corrects instead of sitting there connected.
+SOCKET_URLS = [
+    "wss://socket.india.delta.exchange",
+    "wss://socket.delta.exchange",
+    "wss://public-socket.india.delta.exchange",
+]
+STALL_SECONDS = 25      # No book data this long after connecting -> try the next URL
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
 REFRESH_RATE_MS = 1000  # Refresh interval (1000ms = 1 second)
@@ -45,6 +52,11 @@ class MobileTerminalEngine:
         self.ws_state = "starting"
         self.last_reject = ""
         self.last_ack = ""
+        self.channel_status = {}
+        self.url_index = 0
+        self.connected_at = 0.0
+        self.data_seen = False
+        self.ws = None
 
         self.opens = deque(maxlen=MAX_HISTORY)
         self.highs = deque(maxlen=MAX_HISTORY)
@@ -90,6 +102,8 @@ def update_metrics():
     dBid = best_bid_sz if mobile_pipeline.prev_best_bid_price is None or best_bid > mobile_pipeline.prev_best_bid_price else (best_bid_sz - mobile_pipeline.prev_best_bid_size if best_bid == mobile_pipeline.prev_best_bid_price else -mobile_pipeline.prev_best_bid_size)
     dAsk = best_ask_sz if mobile_pipeline.prev_best_ask_price is None or best_ask < mobile_pipeline.prev_best_ask_price else (best_ask_sz - mobile_pipeline.prev_best_ask_size if best_ask == mobile_pipeline.prev_best_ask_price else -mobile_pipeline.prev_best_ask_size)
     
+    mobile_pipeline.data_seen = True
+
     step_ofi = dBid - dAsk
     mobile_pipeline.cumulative_ofi += step_ofi
 
@@ -126,6 +140,9 @@ def on_message(ws, message):
     # Keep what the feed accepted and what it rejected, so both reach the page.
     if msg_type == "subscriptions":
         mobile_pipeline.last_ack = message[:200]
+        for ch in (data.get("channels") or []):
+            if isinstance(ch, dict) and ch.get("name"):
+                mobile_pipeline.channel_status[ch["name"]] = "ok" if not ch.get("error") else "forbidden"
     elif msg_type not in ("l2_updates", "l2_orderbook", "v2/ticker"):
         if msg_type == "error" or not mobile_pipeline.last_reject:
             mobile_pipeline.last_reject = message[:160]
@@ -166,7 +183,7 @@ def on_open(ws):
         ws.send(json.dumps(payload))
         print(f"[WS] sent subscribe for {name}:{SYMBOL}", flush=True)
     mobile_pipeline.ws_state = "connected"
-    print(f"[WS] connected to {SOCKET_URL}", flush=True)
+    print(f"[WS] connected to {SOCKET_URLS[mobile_pipeline.url_index]}", flush=True)
 
 def on_error(ws, error):
     mobile_pipeline.ws_state = f"error: {type(error).__name__}: {error}"[:90]
@@ -178,28 +195,49 @@ def on_close(ws, status_code, msg):
     print(f"[WS CLOSED] code={status_code} msg={msg}", flush=True)
 
 
+def watchdog():
+    """Abandon an endpoint that connects but never delivers book data."""
+    while True:
+        time.sleep(5)
+        stalled = (not mobile_pipeline.data_seen
+                   and mobile_pipeline.ws_state == "connected"
+                   and time.time() - mobile_pipeline.connected_at > STALL_SECONDS)
+        if stalled and mobile_pipeline.ws is not None:
+            print(f"[WS] no data after {STALL_SECONDS}s, trying next endpoint", flush=True)
+            try: mobile_pipeline.ws.close()
+            except Exception: pass
+
+
 def ws_forever():
     while True:
+        url = SOCKET_URLS[mobile_pipeline.url_index]
         try:
             ws = websocket.WebSocketApp(
-                SOCKET_URL,
+                url,
                 on_open=on_open,
                 on_message=on_message,
                 on_error=on_error,
                 on_close=on_close,
             )
+            mobile_pipeline.ws = ws
+            mobile_pipeline.connected_at = time.time()
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as exc:
             print(f"[WS LOOP ERROR] {exc}", flush=True)
+
+        # Nothing usable came from this endpoint; move to the next one.
+        if not mobile_pipeline.data_seen:
+            mobile_pipeline.url_index = (mobile_pipeline.url_index + 1) % len(SOCKET_URLS)
         mobile_pipeline.ws_state = "reconnecting"
         print("[WS] reconnecting in 5s...", flush=True)
         time.sleep(5)
 
 
 def run_ws():
-    wst = threading.Thread(target=ws_forever)
-    wst.daemon = True
-    wst.start()
+    for target in (ws_forever, watchdog):
+        t = threading.Thread(target=target)
+        t.daemon = True
+        t.start()
 
 run_ws()
 
@@ -248,12 +286,15 @@ def refresh_mobile_view(n):
         type_counts = dict(mobile_pipeline.type_counts)
         last_reject = mobile_pipeline.last_reject
         last_ack = mobile_pipeline.last_ack
+        url_short = SOCKET_URLS[mobile_pipeline.url_index].replace("wss://", "")
+        chan_status = dict(mobile_pipeline.channel_status)
 
     if not times:
         seen = ", ".join(f"{k}x{v}" for k, v in sorted(type_counts.items(), key=lambda kv: -kv[1]))
-        diag = f"WS {ws_state} | frames {frames} | book {len(bids)}/{len(asks)}"
+        diag = f"{url_short} | WS {ws_state} | frames {frames} | book {len(bids)}/{len(asks)}"
+        if chan_status:
+            diag += " | " + ", ".join(f"{k}:{v}" for k, v in sorted(chan_status.items()))
         if seen: diag += f" | {seen}"
-        if last_ack: diag += f" | ACK {last_ack}"
         if last_reject: diag += f" | ERR {last_reject}"
         return diag, {"color": "#db8c02", "fontSize": "11px"}, go.Figure().update_layout(template="plotly_dark")
 
