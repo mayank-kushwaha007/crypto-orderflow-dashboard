@@ -30,11 +30,17 @@ STALL_SECONDS = 25      # No book data this long after connecting -> try the nex
 # this endpoint needs none, so it keeps the chart alive when the socket will not.
 REST_URL = "https://api.india.delta.exchange/v2/l2orderbook/{symbol}?depth=20"
 TICKER_URL = "https://api.india.delta.exchange/v2/tickers/{symbol}"
-REST_INTERVAL = 1.0     # REST is the primary source: polled every second, always
+REST_INTERVAL = 0.5     # REST is the primary source, polled continuously
+REST_MAX_BACKOFF = 8.0  # Failures back off to here, then recover on success
+
+# Render kills a free instance after ~15 minutes without INBOUND traffic.
+# Outbound calls do not count, so the service requests its own public URL.
+KEEPALIVE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEPALIVE_URL", "")
+KEEPALIVE_EVERY = 600   # 10 minutes, comfortably inside the 15 minute window
 DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
-REFRESH_RATE_MS = 1000  # Refresh interval (1000ms = 1 second)
+REFRESH_RATE_MS = 500   # Browser redraw interval, so the open candle moves live
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
 STALE_AFTER = 5         # Seconds without a book update before the ticker says so
 
@@ -237,11 +243,12 @@ def poll_rest():
     """Poll the REST order book whenever the websocket is not delivering."""
     url = REST_URL.format(symbol=SYMBOL)
     headers = {"Accept": "application/json", "User-Agent": "orderflow-dashboard/1.0"}
+    delay = REST_INTERVAL
     while True:
         # Everything is inside the guard: this is the last line of defence, and a
         # thread that dies here takes the fallback down for the process lifetime.
         try:
-            time.sleep(REST_INTERVAL)
+            time.sleep(delay)
             fetch_ltp(headers)
 
             req = urllib.request.Request(url, headers=headers)
@@ -256,9 +263,11 @@ def poll_rest():
                 apply_levels("asks", result.get("sell") or [])
                 update_metrics()
             mobile_pipeline.rest_error = ""
+            delay = REST_INTERVAL
         except Exception as exc:
+            delay = min(delay * 2, REST_MAX_BACKOFF)
             mobile_pipeline.rest_error = f"{type(exc).__name__}: {exc}"[:70]
-            print(f"[REST ERROR] {type(exc).__name__}: {exc}", flush=True)
+            print(f"[REST ERROR] retry in {delay:.1f}s: {type(exc).__name__}: {exc}", flush=True)
 
 
 def watchdog():
@@ -304,7 +313,30 @@ def ws_forever():
         time.sleep(5)
 
 
-WORKERS = (("ws", ws_forever), ("watchdog", watchdog), ("rest", poll_rest))
+def keepalive():
+    """Request our own public URL so Render sees inbound traffic and stays up.
+
+    Only inbound requests count towards Render's idle timer, so calls out to the
+    exchange do not help. This cannot wake an instance that has already been put
+    to sleep -- nothing running inside it is left to make the call -- so it keeps
+    a live instance alive rather than resurrecting a dead one.
+    """
+    if not KEEPALIVE_URL:
+        print("[KEEPALIVE] no RENDER_EXTERNAL_URL or KEEPALIVE_URL set; disabled", flush=True)
+        return
+    headers = {"User-Agent": "orderflow-dashboard-keepalive/1.0"}
+    while True:
+        time.sleep(KEEPALIVE_EVERY)
+        try:
+            req = urllib.request.Request(KEEPALIVE_URL, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                print(f"[KEEPALIVE] {KEEPALIVE_URL} -> {resp.status}", flush=True)
+        except Exception as exc:
+            print(f"[KEEPALIVE ERROR] {type(exc).__name__}: {exc}", flush=True)
+
+
+WORKERS = (("ws", ws_forever), ("watchdog", watchdog), ("rest", poll_rest),
+           ("keepalive", keepalive))
 _threads = {}
 _threads_lock = threading.Lock()
 
@@ -377,7 +409,7 @@ HEAD = dict(CELL, color="#787b86", fontSize="10px", letterSpacing="0.06em",
 def waiting_figure(ws_state, rest_error, ltp_error):
     """Hold the page's shape and say why it is empty, rather than collapsing."""
     live = sum(1 for t in _threads.values() if t.is_alive())
-    lines = [f"waiting for market data  ·  pid {os.getpid()}  ·  {live}/3 feed threads",
+    lines = [f"waiting for market data  ·  pid {os.getpid()}  ·  {live}/{len(WORKERS)} feed threads",
              f"websocket: {ws_state}"]
     lines.append(f"order book: {rest_error}" if rest_error else "order book: polling")
     lines.append(f"last price: {ltp_error}" if ltp_error else "last price: polling")
