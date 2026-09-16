@@ -350,6 +350,7 @@ def keepalive():
     a live instance alive rather than resurrecting a dead one.
     """
     if not KEEPALIVE_URL:
+        _retired.add("keepalive")       # deliberate exit, not a crash to restart
         print("[KEEPALIVE] no RENDER_EXTERNAL_URL or KEEPALIVE_URL set; disabled", flush=True)
         return
     headers = {"User-Agent": "orderflow-dashboard-keepalive/1.0"}
@@ -366,6 +367,7 @@ def keepalive():
 WORKERS = (("ws", ws_forever), ("watchdog", watchdog), ("rest", poll_rest),
            ("keepalive", keepalive))
 _threads = {}
+_retired = set()        # workers that finished on purpose and must not be respawned
 _threads_lock = threading.Lock()
 
 
@@ -412,6 +414,8 @@ def ensure_workers():
 
     with _threads_lock:
         for name, target in WORKERS:
+            if name in _retired:
+                continue
             t = _threads.get(name)
             if t is None or not t.is_alive():
                 t = threading.Thread(target=target, name=name, daemon=True)
