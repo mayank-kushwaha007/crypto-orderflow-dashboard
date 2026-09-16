@@ -8,6 +8,8 @@ import websocket
 import pandas as pd
 import numpy as np
 
+import storage
+
 import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output
@@ -38,6 +40,10 @@ REST_MAX_BACKOFF = 8.0  # Failures back off to here, then recover on success
 _BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEPALIVE_URL", "")
 KEEPALIVE_URL = (_BASE_URL.rstrip("/") + "/health") if _BASE_URL else ""
 KEEPALIVE_EVERY = 600   # 10 minutes, comfortably inside the 15 minute window
+
+# Persistence. Unset DATABASE_URL and everything below degrades to the previous
+# in-memory-only behaviour rather than failing.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
@@ -88,6 +94,7 @@ class MobileTerminalEngine:
         self.closes = deque(maxlen=MAX_HISTORY)
 
 mobile_pipeline = MobileTerminalEngine()
+store = storage.Storage(DATABASE_URL, SYMBOL)
 
 # =====================================================================
 # BACKGROUND DATA INGESTION MATRIX
@@ -124,6 +131,9 @@ def flush_bucket():
     p.prices.append(p.cur_close)
     p.ofi_steps.append(p.cur_ofi)
     p.ofi_history.append(p.cumulative_ofi)
+
+    store.record(p.cur_sec.to_pydatetime(), p.cur_open, p.cur_high, p.cur_low,
+                 p.cur_close, p.cur_ofi, p.cumulative_ofi)
 
 
 def update_metrics():
@@ -342,6 +352,26 @@ _threads = {}
 _threads_lock = threading.Lock()
 
 
+def restore_history():
+    """Reload the last candles so a restart resumes rather than starts over."""
+    rows = store.load_recent(MAX_HISTORY)
+    if not rows:
+        return
+    p = mobile_pipeline
+    with p.lock:
+        if p.timestamps:                 # a live process already has better data
+            return
+        for ts, o, h, l, c, step, cum in rows:
+            p.timestamps.append(pd.Timestamp(ts).tz_localize(None))
+            p.opens.append(o); p.highs.append(h); p.lows.append(l); p.closes.append(c)
+            p.prices.append(c)
+            p.ofi_steps.append(step)
+            p.ofi_history.append(cum)
+        p.cumulative_ofi = rows[-1][6]   # continue the running total
+    print(f"[DB] restored {len(rows)} candles, cumulative OFI resumes at "
+          f"{p.cumulative_ofi:+,.0f}", flush=True)
+
+
 def ensure_workers():
     """Start the feed threads in THIS process, and restart any that have died.
 
@@ -352,6 +382,10 @@ def ensure_workers():
     the callback as well as at import means whichever process answers requests
     is always the one running the feed.
     """
+    if store.enabled and not store._started:
+        store.start()
+        restore_history()
+
     with _threads_lock:
         for name, target in WORKERS:
             t = _threads.get(name)
@@ -399,6 +433,8 @@ def health():
         "rest_error": rest_error or None,
         "pid": os.getpid(),
         "threads": sorted(n for n, t in _threads.items() if t.is_alive()),
+        "storage": {"enabled": store.enabled, "written": store.written,
+                    "dropped": store.dropped, "error": store.error or None},
     }
     return json.dumps(payload), 200, {"Content-Type": "application/json"}
 

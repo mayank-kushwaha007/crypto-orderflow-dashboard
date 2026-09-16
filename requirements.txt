@@ -4,3 +4,4 @@ websocket-client
 pandas
 numpy
 gunicorn
+psycopg[binary]
