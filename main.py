@@ -14,6 +14,7 @@ import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
+from plotly.utils import PlotlyJSONEncoder
 from plotly.subplots import make_subplots
 
 # =====================================================================
@@ -53,7 +54,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
-REFRESH_RATE_MS = 500   # Browser redraw interval, so the open candle moves live
+# Browser update interval. Each frame is ~28KB, so 500ms is about 200MB/hour on
+# a mobile connection; raise this if that matters more than smoothness.
+REFRESH_RATE_MS = int(os.environ.get("REFRESH_RATE_MS", "500"))
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
 # Candles are kept in UTC and converted for display only, so what is stored stays
 # unambiguous while the axis reads in the viewer's own time.
@@ -547,6 +550,34 @@ app = LiveDash(__name__, title=f"TradingView Mobile Terminal")
 server = app.server
 
 
+@server.route("/api/frame")
+def api_frame():
+    """Everything the page needs, as one GET.
+
+    The update callback posts to _dash-update-component and that POST is not
+    reaching this deployment, while every GET does. This carries the same payload
+    over a plain GET so the page can update itself in place.
+    """
+    mobile_pipeline.callbacks += 1
+    mobile_pipeline.last_callback = time.time()
+
+    ticker, ticker_style, fig, ltp, ltp_style, delta, table = _safe_render(0)
+    payload = {
+        "ticker": ticker,
+        "ticker_style": dict(ticker_style, fontWeight="bold"),
+        "figure": fig,
+        "ltp": ltp,
+        "ltp_style": ltp_style,
+        "ltp_delta": delta,
+        "table": table,
+    }
+    # PlotlyJSONEncoder is what Dash serialises layouts with: it recurses into
+    # nested components. to_plotly_json() only converts the outermost one, and a
+    # default=str fallback then stringifies the children into useless text.
+    return json.dumps(payload, cls=PlotlyJSONEncoder), 200, {
+        "Content-Type": "application/json", "Cache-Control": "no-store"}
+
+
 @server.route("/health")
 def health():
     """Cheap liveness probe for an external pinger, and a status readout.
@@ -641,7 +672,23 @@ def serve_layout():
 # =====================================================================
 # RENDERING PIPELINE CONTROLLER CALLBACK
 # =====================================================================
-@app.callback(
+# Updates run clientside, fetching /api/frame over GET, rather than through the
+# server callback's POST to _dash-update-component. Both are ordinary Dash; this
+# one simply does not depend on the request path that is failing on this
+# deployment, and behaves identically where that path works.
+app.clientside_callback(
+    """
+    function(n) {
+        var blank = Array(7).fill(window.dash_clientside.no_update);
+        return fetch('/api/frame', {cache: 'no-store'})
+            .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+            .then(function (d) {
+                return [d.ticker, d.ticker_style, d.figure,
+                        d.ltp, d.ltp_style, d.ltp_delta, d.table];
+            })
+            .catch(function () { return blank; });
+    }
+    """,
     [Output("mobile-ticker-feed", "children"),
      Output("mobile-ticker-feed", "style"),
      Output("mobile-master-chart", "figure"),
@@ -649,12 +696,8 @@ def serve_layout():
      Output("ltp-value", "style"),
      Output("ltp-delta", "children"),
      Output("dom-table", "children")],
-    [Input("mobile-pulse-clock", "n_intervals")]
+    [Input("mobile-pulse-clock", "n_intervals")],
 )
-def refresh_mobile_view(n):
-    mobile_pipeline.callbacks += 1          # a real POST from the browser
-    mobile_pipeline.last_callback = time.time()
-    return _safe_render(n)
 
 
 def _safe_render(n):

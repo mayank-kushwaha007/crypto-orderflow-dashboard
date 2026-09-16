@@ -17,6 +17,7 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
   is emitted **only while the update callback is not arriving**, so where Dash works
   normally — a laptop, a local run — it is absent and the page updates in place. The
   decision is per page load and corrects itself in both directions.
+- `REFRESH_RATE_MS` — browser update interval, default 500.
 - `DISPLAY_TZ` — timezone for chart axis labels, default `Asia/Kolkata`. Display only.
 - `RENDER_EXTERNAL_URL` — set by Render; the keepalive requests it every 10 minutes.
   Only inbound traffic resets Render's idle timer, so calls to the exchange do not
@@ -84,6 +85,19 @@ confirmed from the Render logs instead — do not guess at socket URLs.
 Cumulative OFI is a **UTC daily session total**, not a since-startup figure. It
 resets at 00:00 UTC, and a restart resumes the stored total only within the same
 UTC day. The header labels it `OFI(D)`. Per-second OFI steps are unaffected.
+
+## How updates reach the browser
+
+A clientside callback on the interval fetches `/api/frame` over **GET** and writes the
+result into the page. The server callback's POST to `_dash-update-component` was not
+reaching the Render deployment, while every GET did; this is ordinary Dash either way
+and behaves identically where that path works.
+
+`/api/frame` must serialise with `PlotlyJSONEncoder`, which is what Dash uses for
+layouts. `to_plotly_json()` converts only the outermost component, and a `default=str`
+fallback then turns the children into text, so the table arrives as a string.
+
+Each frame is ~28KB. `REFRESH_RATE_MS` (default 500) is roughly 200MB/hour on mobile.
 
 ## Diagnosing the update path
 
