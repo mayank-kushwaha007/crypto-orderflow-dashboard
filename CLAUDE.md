@@ -103,6 +103,13 @@ mobile link that is 0.4s per frame rather than 5.2s, which is the difference bet
 updating and appearing frozen. The static Plotly template is stripped for the same
 reason — it is ~8KB, identical every frame, and already established by the first render.
 
+The fetch keeps one request in flight at a time and aborts after `FETCH_TIMEOUT_MS`.
+The interval fires whether or not the last frame arrived, so without the guard requests
+pile up on a slow link and saturate the connection they are waiting on — a twelve second
+stall produced twenty-four overlapping fetches in a browser test, four with the guard.
+A hung fetch does **not** freeze Dash permanently; that was tested against the code
+without the timeout and it recovered too, so do not reach for that explanation.
+
 The header carries a `frame-clock` showing when the server built the frame. It advances
 only when a frame actually lands, which separates a stalled feed from a stalled
 transport at a glance.

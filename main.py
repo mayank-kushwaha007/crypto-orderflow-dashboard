@@ -64,6 +64,8 @@ MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewport
 # Browser update interval. Each frame is ~28KB, so 500ms is about 200MB/hour on
 # a mobile connection; raise this if that matters more than smoothness.
 REFRESH_RATE_MS = int(os.environ.get("REFRESH_RATE_MS", "500"))
+FETCH_TIMEOUT_MS = max(4000, REFRESH_RATE_MS * 8)   # Abort a hung frame fetch
+STALL_RELOAD = 8        # Consecutive failed fetches before reloading the page
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
 # Candles are kept in UTC and converted for display only, so what is stored stays
 # unambiguous while the axis reads in the viewer's own time.
@@ -713,15 +715,40 @@ app.clientside_callback(
     """
     function(n) {
         var blank = Array(8).fill(window.dash_clientside.no_update);
-        return fetch('/api/frame', {cache: 'no-store'})
+
+        // One request in flight at a time. The interval fires regardless of
+        // whether the last frame arrived, so on a slow link requests otherwise
+        // pile up and saturate the very connection they are waiting on: a
+        // twelve second stall produced twenty-four overlapping fetches in
+        // testing. Skipping a tick is cheaper than competing with itself.
+        if (window._ofBusy) { return blank; }
+        window._ofBusy = true;
+
+        // Bound each attempt as well, so a request that never settles releases
+        // the slot instead of holding it for good.
+        var ctl = new AbortController();
+        var timer = setTimeout(function () { ctl.abort(); }, %(timeout)d);
+
+        return fetch('/api/frame', {cache: 'no-store', signal: ctl.signal})
             .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
             .then(function (d) {
+                clearTimeout(timer);
+                window._ofBusy = false;
+                window._ofStall = 0;
                 return [d.ticker, d.ticker_style, d.figure,
                         d.ltp, d.ltp_style, d.ltp_delta, d.table, d.clock];
             })
-            .catch(function () { return blank; });
+            .catch(function () {
+                clearTimeout(timer);
+                window._ofBusy = false;
+                // The reload fallback stood down while frames were arriving, so
+                // a client that stalls afterwards has nothing else to recover it.
+                window._ofStall = (window._ofStall || 0) + 1;
+                if (window._ofStall >= %(stall)d) { window._ofStall = 0; location.reload(); }
+                return blank;
+            });
     }
-    """,
+    """ % {"timeout": FETCH_TIMEOUT_MS, "stall": STALL_RELOAD},
     [Output("mobile-ticker-feed", "children"),
      Output("mobile-ticker-feed", "style"),
      Output("mobile-master-chart", "figure"),
