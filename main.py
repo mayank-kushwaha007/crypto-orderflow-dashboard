@@ -552,15 +552,25 @@ def health():
     }
     return json.dumps(payload), 200, {"Content-Type": "application/json"}
 
-app.layout = html.Div(
+def serve_layout():
+    """Rendered on every page load, so a reload always reflects current state.
+
+    Built once at import, the seeded values froze at process start: the panel
+    read "websocket: starting" indefinitely and a reload could never show live
+    data, however healthy the feed was. As a function it also means the page is
+    useful even when the update callback is not reaching the browser.
+    """
+    ticker, ticker_style, fig, ltp, ltp_style, delta, table = refresh_mobile_view(0)
+
+    return html.Div(
     style={"backgroundColor": "#131722", "color": "#d1d4dc", "fontFamily": "sans-serif", "padding": "5px"},
     children=[
         html.Div(
             style={"display": "flex", "justifyContent": "space-between", "borderBottom": "1px solid #2a2e39", "padding": "8px", "fontSize": "13px"},
             children=[
                 html.Span(f"📊 {SYMBOL} • 1S • DELTA", style={"fontWeight": "bold", "color": "#f2f3f5"}),
-                html.Div(id="mobile-ticker-feed", children="CONNECTING…",
-                         style={"fontWeight": "bold", "color": "#db8c02"})
+                html.Div(id="mobile-ticker-feed", children=ticker,
+                         style=dict(ticker_style, fontWeight="bold"))
             ]
         ),
         html.Div(
@@ -569,21 +579,17 @@ app.layout = html.Div(
             children=[
                 html.Span("LTP", style={"color": "#787b86", "fontSize": "11px",
                                         "letterSpacing": "0.08em"}),
-                html.Span(id="ltp-value", children="—",
-                          style={"fontSize": "28px", "fontWeight": "bold",
-                                 "color": "#787b86", "fontVariantNumeric": "tabular-nums"}),
-                html.Span(id="ltp-delta", style={"fontSize": "12px",
-                                                 "fontVariantNumeric": "tabular-nums"}),
+                html.Span(id="ltp-value", children=ltp, style=ltp_style),
+                html.Span(id="ltp-delta", children=delta,
+                          style={"fontSize": "12px", "fontVariantNumeric": "tabular-nums"}),
             ]
         ),
-        # Seeded, so the first paint is the dark waiting state rather than Plotly's
-        # default white axes while the first callback is still in flight.
-        dcc.Graph(id="mobile-master-chart", figure=waiting_figure("starting", "", ""),
+        dcc.Graph(id="mobile-master-chart", figure=fig,
                   config={"displayModeBar": False, "scrollZoom": True}),
-        html.Div(id="dom-table", style={"padding": "4px 8px 12px"}),
+        html.Div(id="dom-table", children=table, style={"padding": "4px 8px 12px"}),
         dcc.Interval(id="mobile-pulse-clock", interval=REFRESH_RATE_MS, n_intervals=0)
     ]
-)
+    )
 
 # =====================================================================
 # RENDERING PIPELINE CONTROLLER CALLBACK
@@ -732,6 +738,11 @@ def _render(n):
 
     return (ticker_text, {"color": ticker_color}, fig,
             ltp_text, ltp_style, ltp_delta, table)
+
+# Assigned here rather than beside the definition: Dash evaluates the callable
+# immediately to validate it, and it renders through refresh_mobile_view below.
+app.layout = serve_layout
+
 
 # =====================================================================
 # CLOUD PRODUCTION SERVICE DEPLOYMENT RUN ENGINE
