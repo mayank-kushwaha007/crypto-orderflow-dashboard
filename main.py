@@ -84,6 +84,9 @@ class MobileTerminalEngine:
         self.conn_started = 0.0
         self.rest_error = ""
         self.ltp_error = ""
+        self.callbacks = 0              # renders served, to tell client from server
+        self.last_callback = 0.0
+        self.render_error = ""
         self.ltp = None                 # last traded price, from the ticker endpoint
         self.prev_ltp = None
         self.last_update = 0.0          # wall clock of the last book update, any source
@@ -535,6 +538,11 @@ def health():
         "rest_error": rest_error or None,
         "pid": os.getpid(),
         "threads": sorted(n for n, t in _threads.items() if t.is_alive()),
+        "callbacks": mobile_pipeline.callbacks,
+        "seconds_since_callback": (round(time.time() - mobile_pipeline.last_callback, 1)
+                                   if mobile_pipeline.last_callback else None),
+        "render_error": mobile_pipeline.render_error or None,
+        "dash_version": dash.__version__,
         "storage": {"enabled": store.enabled, "written": store.written,
                     "dropped": store.dropped, "error": store.error or None},
     }
@@ -592,6 +600,7 @@ def refresh_mobile_view(n):
     except Exception as exc:
         # Raising here means Dash sends no update at all, and the page sits on
         # whatever it last drew with nothing to say why. Show the fault instead.
+        mobile_pipeline.render_error = f"{type(exc).__name__}: {exc}"[:120]
         print(f"[RENDER ERROR] {type(exc).__name__}: {exc}", flush=True)
         msg = f"RENDER ERROR · {type(exc).__name__}: {exc}"[:140]
         return (msg, {"color": "#f23645", "fontSize": "11px"},
@@ -600,6 +609,8 @@ def refresh_mobile_view(n):
 
 
 def _render(n):
+    mobile_pipeline.callbacks += 1
+    mobile_pipeline.last_callback = time.time()
     ensure_workers()        # a forked worker starts its own feed on first request
 
     with mobile_pipeline.lock:
