@@ -403,7 +403,9 @@ def ensure_workers():
     """
     if store.enabled and not store._started:
         store.start()
-        restore_history()
+        # Off the request path: restore_history() connects and queries, and a slow
+        # or unreachable database would otherwise stall every callback behind it.
+        threading.Thread(target=restore_history, name="restore", daemon=True).start()
 
     with _threads_lock:
         for name, target in WORKERS:
@@ -419,75 +421,6 @@ ensure_workers()
 
 # =====================================================================
 # DASH PRESENTATION CONTAINER SETUP
-# =====================================================================
-app = dash.Dash(__name__, title=f"TradingView Mobile Terminal")
-server = app.server
-
-
-@server.route("/health")
-def health():
-    """Cheap liveness probe for an external pinger, and a status readout.
-
-    Serving this is far lighter than rendering the whole page, and it doubles as
-    the hook that starts this worker's feed: a ping keeps the process both awake
-    and collecting, not merely awake.
-    """
-    ensure_workers()
-    with mobile_pipeline.lock:
-        bids = len(mobile_pipeline.order_book["bids"])
-        asks = len(mobile_pipeline.order_book["asks"])
-        last_update = mobile_pipeline.last_update
-        ltp = mobile_pipeline.ltp
-        ws_state = mobile_pipeline.ws_state
-        rest_error = mobile_pipeline.rest_error
-
-    age = round(time.time() - last_update, 1) if last_update else None
-    payload = {
-        "status": "ok" if age is not None and age < STALE_AFTER else "stale",
-        "symbol": SYMBOL,
-        "session_day": str(mobile_pipeline.session_day.date()) if mobile_pipeline.session_day else None,
-        "ltp": ltp,
-        "book": {"bids": bids, "asks": asks},
-        "seconds_since_update": age,
-        "websocket": ws_state,
-        "rest_error": rest_error or None,
-        "pid": os.getpid(),
-        "threads": sorted(n for n, t in _threads.items() if t.is_alive()),
-        "storage": {"enabled": store.enabled, "written": store.written,
-                    "dropped": store.dropped, "error": store.error or None},
-    }
-    return json.dumps(payload), 200, {"Content-Type": "application/json"}
-
-app.layout = html.Div(
-    style={"backgroundColor": "#131722", "color": "#d1d4dc", "fontFamily": "sans-serif", "padding": "5px"},
-    children=[
-        html.Div(
-            style={"display": "flex", "justifyContent": "space-between", "borderBottom": "1px solid #2a2e39", "padding": "8px", "fontSize": "13px"},
-            children=[
-                html.Span(f"📊 {SYMBOL} • 1S • DELTA", style={"fontWeight": "bold", "color": "#f2f3f5"}),
-                html.Div(id="mobile-ticker-feed", style={"fontWeight": "bold"})
-            ]
-        ),
-        html.Div(
-            style={"display": "flex", "alignItems": "baseline", "gap": "10px",
-                   "padding": "10px 8px 6px"},
-            children=[
-                html.Span("LTP", style={"color": "#787b86", "fontSize": "11px",
-                                        "letterSpacing": "0.08em"}),
-                html.Span(id="ltp-value", style={"fontSize": "28px", "fontWeight": "bold",
-                                                 "fontVariantNumeric": "tabular-nums"}),
-                html.Span(id="ltp-delta", style={"fontSize": "12px",
-                                                 "fontVariantNumeric": "tabular-nums"}),
-            ]
-        ),
-        dcc.Graph(id="mobile-master-chart", config={"displayModeBar": False, "scrollZoom": True}),
-        html.Div(id="dom-table", style={"padding": "4px 8px 12px"}),
-        dcc.Interval(id="mobile-pulse-clock", interval=REFRESH_RATE_MS, n_intervals=0)
-    ]
-)
-
-# =====================================================================
-# RENDERING PIPELINE CONTROLLER CALLBACK
 # =====================================================================
 CELL = {"padding": "3px 10px", "fontVariantNumeric": "tabular-nums",
         "fontFamily": "ui-monospace, Menlo, monospace", "fontSize": "12px"}
@@ -568,6 +501,81 @@ def dom_table(bids, asks):
         ])
 
 
+
+app = dash.Dash(__name__, title=f"TradingView Mobile Terminal")
+server = app.server
+
+
+@server.route("/health")
+def health():
+    """Cheap liveness probe for an external pinger, and a status readout.
+
+    Serving this is far lighter than rendering the whole page, and it doubles as
+    the hook that starts this worker's feed: a ping keeps the process both awake
+    and collecting, not merely awake.
+    """
+    ensure_workers()
+    with mobile_pipeline.lock:
+        bids = len(mobile_pipeline.order_book["bids"])
+        asks = len(mobile_pipeline.order_book["asks"])
+        last_update = mobile_pipeline.last_update
+        ltp = mobile_pipeline.ltp
+        ws_state = mobile_pipeline.ws_state
+        rest_error = mobile_pipeline.rest_error
+
+    age = round(time.time() - last_update, 1) if last_update else None
+    payload = {
+        "status": "ok" if age is not None and age < STALE_AFTER else "stale",
+        "symbol": SYMBOL,
+        "session_day": str(mobile_pipeline.session_day.date()) if mobile_pipeline.session_day else None,
+        "ltp": ltp,
+        "book": {"bids": bids, "asks": asks},
+        "seconds_since_update": age,
+        "websocket": ws_state,
+        "rest_error": rest_error or None,
+        "pid": os.getpid(),
+        "threads": sorted(n for n, t in _threads.items() if t.is_alive()),
+        "storage": {"enabled": store.enabled, "written": store.written,
+                    "dropped": store.dropped, "error": store.error or None},
+    }
+    return json.dumps(payload), 200, {"Content-Type": "application/json"}
+
+app.layout = html.Div(
+    style={"backgroundColor": "#131722", "color": "#d1d4dc", "fontFamily": "sans-serif", "padding": "5px"},
+    children=[
+        html.Div(
+            style={"display": "flex", "justifyContent": "space-between", "borderBottom": "1px solid #2a2e39", "padding": "8px", "fontSize": "13px"},
+            children=[
+                html.Span(f"📊 {SYMBOL} • 1S • DELTA", style={"fontWeight": "bold", "color": "#f2f3f5"}),
+                html.Div(id="mobile-ticker-feed", children="CONNECTING…",
+                         style={"fontWeight": "bold", "color": "#db8c02"})
+            ]
+        ),
+        html.Div(
+            style={"display": "flex", "alignItems": "baseline", "gap": "10px",
+                   "padding": "10px 8px 6px"},
+            children=[
+                html.Span("LTP", style={"color": "#787b86", "fontSize": "11px",
+                                        "letterSpacing": "0.08em"}),
+                html.Span(id="ltp-value", children="—",
+                          style={"fontSize": "28px", "fontWeight": "bold",
+                                 "color": "#787b86", "fontVariantNumeric": "tabular-nums"}),
+                html.Span(id="ltp-delta", style={"fontSize": "12px",
+                                                 "fontVariantNumeric": "tabular-nums"}),
+            ]
+        ),
+        # Seeded, so the first paint is the dark waiting state rather than Plotly's
+        # default white axes while the first callback is still in flight.
+        dcc.Graph(id="mobile-master-chart", figure=waiting_figure("starting", "", ""),
+                  config={"displayModeBar": False, "scrollZoom": True}),
+        html.Div(id="dom-table", style={"padding": "4px 8px 12px"}),
+        dcc.Interval(id="mobile-pulse-clock", interval=REFRESH_RATE_MS, n_intervals=0)
+    ]
+)
+
+# =====================================================================
+# RENDERING PIPELINE CONTROLLER CALLBACK
+# =====================================================================
 @app.callback(
     [Output("mobile-ticker-feed", "children"),
      Output("mobile-ticker-feed", "style"),
@@ -579,6 +587,19 @@ def dom_table(bids, asks):
     [Input("mobile-pulse-clock", "n_intervals")]
 )
 def refresh_mobile_view(n):
+    try:
+        return _render(n)
+    except Exception as exc:
+        # Raising here means Dash sends no update at all, and the page sits on
+        # whatever it last drew with nothing to say why. Show the fault instead.
+        print(f"[RENDER ERROR] {type(exc).__name__}: {exc}", flush=True)
+        msg = f"RENDER ERROR · {type(exc).__name__}: {exc}"[:140]
+        return (msg, {"color": "#f23645", "fontSize": "11px"},
+                waiting_figure(msg, "", ""), "—",
+                {"fontSize": "28px", "fontWeight": "bold", "color": "#787b86"}, "", None)
+
+
+def _render(n):
     ensure_workers()        # a forked worker starts its own feed on first request
 
     with mobile_pipeline.lock:
