@@ -97,7 +97,15 @@ and behaves identically where that path works.
 layouts. `to_plotly_json()` converts only the outermost component, and a `default=str`
 fallback then turns the children into text, so the table arrives as a string.
 
-Each frame is ~28KB. `REFRESH_RATE_MS` (default 500) is roughly 200MB/hour on mobile.
+The frame is gzipped, which matters more than it sounds: the ladder repeats the same
+inline style on all 40 cells, so 21KB of JSON compresses to about 1.6KB. On a 4KB/s
+mobile link that is 0.4s per frame rather than 5.2s, which is the difference between
+updating and appearing frozen. The static Plotly template is stripped for the same
+reason — it is ~8KB, identical every frame, and already established by the first render.
+
+The header carries a `frame-clock` showing when the server built the frame. It advances
+only when a frame actually lands, which separates a stalled feed from a stalled
+transport at a glance.
 
 ## Diagnosing the update path
 

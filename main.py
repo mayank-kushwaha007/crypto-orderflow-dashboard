@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import urllib.request
@@ -12,6 +13,7 @@ import storage
 
 import dash
 from dash import dcc, html
+from flask import request
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
 from plotly.utils import PlotlyJSONEncoder
@@ -562,10 +564,16 @@ def api_frame():
     mobile_pipeline.last_callback = time.time()
 
     ticker, ticker_style, fig, ltp, ltp_style, delta, table = _safe_render(0)
+    # The Plotly template is ~8KB, static, and already established by the first
+    # render. Resending it on every frame is most of the payload on a slow link.
+    fig_json = fig.to_plotly_json()
+    fig_json.get("layout", {}).pop("template", None)
+
     payload = {
+        "clock": frame_clock(),
         "ticker": ticker,
         "ticker_style": dict(ticker_style, fontWeight="bold"),
-        "figure": fig,
+        "figure": fig_json,
         "ltp": ltp,
         "ltp_style": ltp_style,
         "ltp_delta": delta,
@@ -574,8 +582,18 @@ def api_frame():
     # PlotlyJSONEncoder is what Dash serialises layouts with: it recurses into
     # nested components. to_plotly_json() only converts the outermost one, and a
     # default=str fallback then stringifies the children into useless text.
-    return json.dumps(payload, cls=PlotlyJSONEncoder), 200, {
-        "Content-Type": "application/json", "Cache-Control": "no-store"}
+    body = json.dumps(payload, cls=PlotlyJSONEncoder)
+    headers = {"Content-Type": "application/json", "Cache-Control": "no-store"}
+
+    # The frame is highly repetitive -- every ladder cell carries the same inline
+    # style -- so it compresses by about 92%. On a slow mobile link that is the
+    # difference between a frame arriving in half a second and in five.
+    if "gzip" in (request.headers.get("Accept-Encoding") or ""):
+        body = gzip.compress(body.encode(), 6)
+        headers["Content-Encoding"] = "gzip"
+        headers["Vary"] = "Accept-Encoding"
+
+    return body, 200, headers
 
 
 @server.route("/health")
@@ -617,6 +635,12 @@ def health():
     }
     return json.dumps(payload), 200, {"Content-Type": "application/json"}
 
+def frame_clock():
+    """Server time this frame was built. It advances only when a frame actually
+    reaches the page, which separates a stalled feed from a stalled transport."""
+    return pd.Timestamp.now(tz="UTC").tz_convert(DISPLAY_TZ).strftime("%H:%M:%S")
+
+
 def callback_badge():
     """One short string saying whether Dash's in-place updates are reaching the
     browser. Rendered server-side on every page load, so it is visible without
@@ -645,6 +669,9 @@ def serve_layout():
             style={"display": "flex", "justifyContent": "space-between", "borderBottom": "1px solid #2a2e39", "padding": "8px", "fontSize": "13px"},
             children=[
                 html.Span(f"📊 {SYMBOL} • 1S • DELTA", style={"fontWeight": "bold", "color": "#f2f3f5"}),
+                html.Span(id="frame-clock", children=frame_clock(),
+                          style={"fontSize": "11px", "color": "#787b86",
+                                 "fontFamily": "ui-monospace, monospace"}),
                 html.Span(callback_badge(), style={"fontSize": "10px", "color": "#787b86",
                                                    "fontFamily": "ui-monospace, monospace"}),
                 html.Div(id="mobile-ticker-feed", children=ticker,
@@ -679,12 +706,12 @@ def serve_layout():
 app.clientside_callback(
     """
     function(n) {
-        var blank = Array(7).fill(window.dash_clientside.no_update);
+        var blank = Array(8).fill(window.dash_clientside.no_update);
         return fetch('/api/frame', {cache: 'no-store'})
             .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
             .then(function (d) {
                 return [d.ticker, d.ticker_style, d.figure,
-                        d.ltp, d.ltp_style, d.ltp_delta, d.table];
+                        d.ltp, d.ltp_style, d.ltp_delta, d.table, d.clock];
             })
             .catch(function () { return blank; });
     }
@@ -695,7 +722,8 @@ app.clientside_callback(
      Output("ltp-value", "children"),
      Output("ltp-value", "style"),
      Output("ltp-delta", "children"),
-     Output("dom-table", "children")],
+     Output("dom-table", "children"),
+     Output("frame-clock", "children")],
     [Input("mobile-pulse-clock", "n_intervals")],
 )
 
