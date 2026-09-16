@@ -74,6 +74,12 @@ confirmed from the Render logs instead — do not guess at socket URLs.
 - Never commit `__pycache__/` or `.pyc` files.
 - Keep each change minimal and scoped to what was agreed.
 
+## OFI semantics
+
+Cumulative OFI is a **UTC daily session total**, not a since-startup figure. It
+resets at 00:00 UTC, and a restart resumes the stored total only within the same
+UTC day. The header labels it `OFI(D)`. Per-second OFI steps are unaffected.
+
 ## Known rough edges (left deliberately — do not "fix" unprompted)
 
 - One data point is appended per websocket message, not per second, so the `1S` label
