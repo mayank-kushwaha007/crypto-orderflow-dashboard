@@ -41,6 +41,11 @@ _BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEPALIVE_U
 KEEPALIVE_URL = (_BASE_URL.rstrip("/") + "/health") if _BASE_URL else ""
 KEEPALIVE_EVERY = 600   # 10 minutes, comfortably inside the 15 minute window
 
+# The layout is rendered per request, so reloading the page is a real refresh.
+# This drives live updates where the in-place callback is not reaching the
+# browser. Set to 0 to disable it and rely on the callback alone.
+AUTO_REFRESH_SECONDS = int(os.environ.get("AUTO_REFRESH_SECONDS", "5"))
+
 # Persistence. Unset DATABASE_URL and everything below degrades to the previous
 # in-memory-only behaviour rather than failing.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -741,6 +746,11 @@ def _render(n):
 
 # Assigned here rather than beside the definition: Dash evaluates the callable
 # immediately to validate it, and it renders through refresh_mobile_view below.
+if AUTO_REFRESH_SECONDS > 0:
+    app.index_string = app.index_string.replace(
+        "{%metas%}",
+        f'{{%metas%}}\n        <meta http-equiv="refresh" content="{AUTO_REFRESH_SECONDS}">')
+
 app.layout = serve_layout
 
 

@@ -13,6 +13,9 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
 - `DATABASE_URL` — Postgres connection string. **Unset is a supported mode**: storage
   goes inert and the app behaves exactly as it did before. Never make persistence
   load-bearing for the live chart.
+- `AUTO_REFRESH_SECONDS` — page auto-reload interval, default 5, `0` disables. The
+  layout is rendered per request, so a reload is a real refresh; this drives live
+  updates where the in-place callback is not reaching the browser.
 - `RENDER_EXTERNAL_URL` — set by Render; the keepalive requests it every 10 minutes.
   Only inbound traffic resets Render's idle timer, so calls to the exchange do not
   keep the instance up.
@@ -79,6 +82,11 @@ confirmed from the Render logs instead — do not guess at socket URLs.
 Cumulative OFI is a **UTC daily session total**, not a since-startup figure. It
 resets at 00:00 UTC, and a restart resumes the stored total only within the same
 UTC day. The header labels it `OFI(D)`. Per-second OFI steps are unaffected.
+
+## Timestamps
+
+Chart timestamps are the server's clock, which is UTC on Render. A viewer in
+IST sees candles 5h30m "behind" their phone; that is the timezone, not stale data.
 
 ## Known rough edges (left deliberately — do not "fix" unprompted)
 
