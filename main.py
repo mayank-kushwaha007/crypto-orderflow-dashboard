@@ -54,6 +54,9 @@ SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
 REFRESH_RATE_MS = 500   # Browser redraw interval, so the open candle moves live
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
+# Candles are kept in UTC and converted for display only, so what is stored stays
+# unambiguous while the axis reads in the viewer's own time.
+DISPLAY_TZ = os.environ.get("DISPLAY_TZ", "Asia/Kolkata")
 STALE_AFTER = 5         # Seconds without a book update before the ticker says so
 
 class MobileTerminalEngine:
@@ -180,7 +183,7 @@ def update_metrics():
     # Fold this update into the current second rather than emitting a point per
     # message: the feed bursts many updates per second, which collapses the
     # timeline to milliseconds and makes every candle degenerate.
-    sec = pd.Timestamp.now().floor(BUCKET)
+    sec = pd.Timestamp.now(tz="UTC").floor(BUCKET)
 
     if p.cur_sec is None:
         p.cur_sec = sec
@@ -386,7 +389,7 @@ def restore_history():
         if p.timestamps:                 # a live process already has better data
             return
         for ts, o, h, l, c, step, cum in rows:
-            p.timestamps.append(pd.Timestamp(ts).tz_localize(None))
+            p.timestamps.append(pd.Timestamp(ts).tz_convert("UTC"))
             p.opens.append(o); p.highs.append(h); p.lows.append(l); p.closes.append(c)
             p.prices.append(c)
             p.ofi_steps.append(step)
@@ -652,6 +655,10 @@ def _render(n):
         rest_error = mobile_pipeline.rest_error
         ltp_error = mobile_pipeline.ltp_error
         ltp, prev_ltp = mobile_pipeline.ltp, mobile_pipeline.prev_ltp
+
+    # Converted here, before anything is plotted: the series is kept in UTC and
+    # only the axis reads in local time.
+    times = [t.tz_convert(DISPLAY_TZ) for t in times]
 
     ltp_text, ltp_style, ltp_delta = format_ltp(ltp, prev_ltp)
     table = dom_table(bids, asks)

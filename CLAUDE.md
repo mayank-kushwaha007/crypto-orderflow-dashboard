@@ -16,6 +16,7 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
 - `AUTO_REFRESH_SECONDS` — page auto-reload interval, default 5, `0` disables. The
   layout is rendered per request, so a reload is a real refresh; this drives live
   updates where the in-place callback is not reaching the browser.
+- `DISPLAY_TZ` — timezone for chart axis labels, default `Asia/Kolkata`. Display only.
 - `RENDER_EXTERNAL_URL` — set by Render; the keepalive requests it every 10 minutes.
   Only inbound traffic resets Render's idle timer, so calls to the exchange do not
   keep the instance up.
@@ -85,8 +86,9 @@ UTC day. The header labels it `OFI(D)`. Per-second OFI steps are unaffected.
 
 ## Timestamps
 
-Chart timestamps are the server's clock, which is UTC on Render. A viewer in
-IST sees candles 5h30m "behind" their phone; that is the timezone, not stale data.
+Candles are kept in UTC throughout — in memory and in Postgres — and converted to
+`DISPLAY_TZ` (default `Asia/Kolkata`) only when the axis is drawn. Keep it that
+way: storing local time makes stored data ambiguous across DST and deployments.
 
 ## Known rough edges (left deliberately — do not "fix" unprompted)
 
