@@ -53,6 +53,11 @@ CALLBACK_FRESH = 5.0    # A callback this recent means in-place updates are work
 # Persistence. Unset DATABASE_URL and everything below degrades to the previous
 # in-memory-only behaviour rather than failing.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Render sets RENDER_GIT_COMMIT on every deploy. Reporting it makes "is the
+# running code current?" answerable from the page instead of by inference.
+GIT_COMMIT = (os.environ.get("RENDER_GIT_COMMIT")
+              or os.environ.get("GIT_COMMIT", "local"))[:7]
 DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
@@ -617,6 +622,7 @@ def health():
     payload = {
         "status": "ok" if age is not None and age < STALE_AFTER else "stale",
         "symbol": SYMBOL,
+        "commit": GIT_COMMIT,
         "session_day": str(mobile_pipeline.session_day.date()) if mobile_pipeline.session_day else None,
         "ltp": ltp,
         "book": {"bids": bids, "asks": asks},
@@ -648,8 +654,8 @@ def callback_badge():
     n = mobile_pipeline.callbacks
     last = mobile_pipeline.last_callback
     if not last:
-        return f"cb {n} · never"
-    return f"cb {n} · {time.time() - last:.1f}s"
+        return f"cb {n} · never · {GIT_COMMIT}"
+    return f"cb {n} · {time.time() - last:.1f}s · {GIT_COMMIT}"
 
 
 def serve_layout():

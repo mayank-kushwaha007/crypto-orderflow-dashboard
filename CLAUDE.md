@@ -109,7 +109,11 @@ transport at a glance.
 
 ## Diagnosing the update path
 
-The header carries a `cb N · Xs` badge, rendered server-side on every page load:
+The running commit is reported as `GIT_COMMIT`, from Render's `RENDER_GIT_COMMIT`, in
+`/health` and in the header badge. Compare it against `main` to tell whether a deploy
+actually landed, rather than inferring it from behaviour.
+
+The header carries a `cb N · Xs · <commit>` badge, rendered server-side on every page load:
 callbacks received from the browser, and how long since the last one. `cb 0 · never`
 means the browser's POSTs are not arriving at all; a rising count means Dash is
 updating in place. Only the Dash callback increments it — `serve_layout` renders the
