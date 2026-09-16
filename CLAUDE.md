@@ -13,9 +13,10 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
 - `DATABASE_URL` — Postgres connection string. **Unset is a supported mode**: storage
   goes inert and the app behaves exactly as it did before. Never make persistence
   load-bearing for the live chart.
-- `AUTO_REFRESH_SECONDS` — page auto-reload interval, default 5, `0` disables. The
-  layout is rendered per request, so a reload is a real refresh; this drives live
-  updates where the in-place callback is not reaching the browser.
+- `AUTO_REFRESH_SECONDS` — fallback reload interval, default 5, `0` disables. The tag
+  is emitted **only while the update callback is not arriving**, so where Dash works
+  normally — a laptop, a local run — it is absent and the page updates in place. The
+  decision is per page load and corrects itself in both directions.
 - `DISPLAY_TZ` — timezone for chart axis labels, default `Asia/Kolkata`. Display only.
 - `RENDER_EXTERNAL_URL` — set by Render; the keepalive requests it every 10 minutes.
   Only inbound traffic resets Render's idle timer, so calls to the exchange do not
@@ -83,6 +84,15 @@ confirmed from the Render logs instead — do not guess at socket URLs.
 Cumulative OFI is a **UTC daily session total**, not a since-startup figure. It
 resets at 00:00 UTC, and a restart resumes the stored total only within the same
 UTC day. The header labels it `OFI(D)`. Per-second OFI steps are unaffected.
+
+## Diagnosing the update path
+
+The header carries a `cb N · Xs` badge, rendered server-side on every page load:
+callbacks received from the browser, and how long since the last one. `cb 0 · never`
+means the browser's POSTs are not arriving at all; a rising count means Dash is
+updating in place. Only the Dash callback increments it — `serve_layout` renders the
+same view server-side and must never count, or the badge reports updates as arriving
+when the browser has sent nothing.
 
 ## Timestamps
 

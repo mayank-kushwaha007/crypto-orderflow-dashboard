@@ -45,6 +45,7 @@ KEEPALIVE_EVERY = 600   # 10 minutes, comfortably inside the 15 minute window
 # This drives live updates where the in-place callback is not reaching the
 # browser. Set to 0 to disable it and rely on the callback alone.
 AUTO_REFRESH_SECONDS = int(os.environ.get("AUTO_REFRESH_SECONDS", "5"))
+CALLBACK_FRESH = 5.0    # A callback this recent means in-place updates are working
 
 # Persistence. Unset DATABASE_URL and everything below degrades to the previous
 # in-memory-only behaviour rather than failing.
@@ -517,7 +518,32 @@ def dom_table(bids, asks):
 
 
 
-app = dash.Dash(__name__, title=f"TradingView Mobile Terminal")
+def callbacks_arriving():
+    """True when the in-place update callback has run recently enough to drive
+    the page on its own."""
+    last = mobile_pipeline.last_callback
+    return bool(last) and (time.time() - last) < CALLBACK_FRESH
+
+
+class LiveDash(dash.Dash):
+    """Emits the reload meta tag only while the update callback is not arriving.
+
+    Where the callback works -- a laptop, a local run, another Dash project --
+    the tag is absent and the page updates in place as Dash intends. Where it
+    does not, the reload keeps the page live rather than frozen. The decision is
+    made per page load, so it corrects itself in both directions.
+    """
+
+    def interpolate_index(self, **kwargs):
+        doc = super().interpolate_index(**kwargs)
+        if AUTO_REFRESH_SECONDS > 0 and not callbacks_arriving():
+            doc = doc.replace(
+                "<head>",
+                f'<head><meta http-equiv="refresh" content="{AUTO_REFRESH_SECONDS}">', 1)
+        return doc
+
+
+app = LiveDash(__name__, title=f"TradingView Mobile Terminal")
 server = app.server
 
 
@@ -560,6 +586,17 @@ def health():
     }
     return json.dumps(payload), 200, {"Content-Type": "application/json"}
 
+def callback_badge():
+    """One short string saying whether Dash's in-place updates are reaching the
+    browser. Rendered server-side on every page load, so it is visible without
+    opening /health or a console."""
+    n = mobile_pipeline.callbacks
+    last = mobile_pipeline.last_callback
+    if not last:
+        return f"cb {n} · never"
+    return f"cb {n} · {time.time() - last:.1f}s"
+
+
 def serve_layout():
     """Rendered on every page load, so a reload always reflects current state.
 
@@ -568,7 +605,7 @@ def serve_layout():
     data, however healthy the feed was. As a function it also means the page is
     useful even when the update callback is not reaching the browser.
     """
-    ticker, ticker_style, fig, ltp, ltp_style, delta, table = refresh_mobile_view(0)
+    ticker, ticker_style, fig, ltp, ltp_style, delta, table = _safe_render(0)
 
     return html.Div(
     style={"backgroundColor": "#131722", "color": "#d1d4dc", "fontFamily": "sans-serif", "padding": "5px"},
@@ -577,6 +614,8 @@ def serve_layout():
             style={"display": "flex", "justifyContent": "space-between", "borderBottom": "1px solid #2a2e39", "padding": "8px", "fontSize": "13px"},
             children=[
                 html.Span(f"📊 {SYMBOL} • 1S • DELTA", style={"fontWeight": "bold", "color": "#f2f3f5"}),
+                html.Span(callback_badge(), style={"fontSize": "10px", "color": "#787b86",
+                                                   "fontFamily": "ui-monospace, monospace"}),
                 html.Div(id="mobile-ticker-feed", children=ticker,
                          style=dict(ticker_style, fontWeight="bold"))
             ]
@@ -613,6 +652,12 @@ def serve_layout():
     [Input("mobile-pulse-clock", "n_intervals")]
 )
 def refresh_mobile_view(n):
+    mobile_pipeline.callbacks += 1          # a real POST from the browser
+    mobile_pipeline.last_callback = time.time()
+    return _safe_render(n)
+
+
+def _safe_render(n):
     try:
         return _render(n)
     except Exception as exc:
@@ -627,8 +672,6 @@ def refresh_mobile_view(n):
 
 
 def _render(n):
-    mobile_pipeline.callbacks += 1
-    mobile_pipeline.last_callback = time.time()
     ensure_workers()        # a forked worker starts its own feed on first request
 
     with mobile_pipeline.lock:
@@ -753,11 +796,6 @@ def _render(n):
 
 # Assigned here rather than beside the definition: Dash evaluates the callable
 # immediately to validate it, and it renders through refresh_mobile_view below.
-if AUTO_REFRESH_SECONDS > 0:
-    app.index_string = app.index_string.replace(
-        "{%metas%}",
-        f'{{%metas%}}\n        <meta http-equiv="refresh" content="{AUTO_REFRESH_SECONDS}">')
-
 app.layout = serve_layout
 
 
