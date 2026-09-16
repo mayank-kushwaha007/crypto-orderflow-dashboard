@@ -17,7 +17,8 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
   is emitted **only while the update callback is not arriving**, so where Dash works
   normally — a laptop, a local run — it is absent and the page updates in place. The
   decision is per page load and corrects itself in both directions.
-- `REFRESH_RATE_MS` — browser update interval, default 500.
+- `REFRESH_RATE_MS` — browser update interval, default 1000. A gzipped frame is ~1.6KB,
+  so this needs about 1.6KB/s, roughly 6MB/hour. 500 doubles both.
 - `DISPLAY_TZ` — timezone for chart axis labels, default `Asia/Kolkata`. Display only.
 - `RENDER_EXTERNAL_URL` — set by Render; the keepalive requests it every 10 minutes.
   Only inbound traffic resets Render's idle timer, so calls to the exchange do not
