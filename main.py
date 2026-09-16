@@ -30,11 +30,17 @@ STALL_SECONDS = 25      # No book data this long after connecting -> try the nex
 # this endpoint needs none, so it keeps the chart alive when the socket will not.
 REST_URL = "https://api.india.delta.exchange/v2/l2orderbook/{symbol}?depth=20"
 TICKER_URL = "https://api.india.delta.exchange/v2/tickers/{symbol}"
-REST_INTERVAL = 1.0     # REST is the primary source: polled every second, always
+REST_INTERVAL = 0.5     # REST is the primary source, polled continuously
+REST_MAX_BACKOFF = 8.0  # Failures back off to here, then recover on success
+
+# Render kills a free instance after ~15 minutes without INBOUND traffic.
+# Outbound calls do not count, so the service requests its own public URL.
+KEEPALIVE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEPALIVE_URL", "")
+KEEPALIVE_EVERY = 600   # 10 minutes, comfortably inside the 15 minute window
 DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
-REFRESH_RATE_MS = 1000  # Refresh interval (1000ms = 1 second)
+REFRESH_RATE_MS = 500   # Browser redraw interval, so the open candle moves live
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
 STALE_AFTER = 5         # Seconds without a book update before the ticker says so
 
@@ -69,6 +75,7 @@ class MobileTerminalEngine:
         self.last_ws_data = 0.0
         self.conn_started = 0.0
         self.rest_error = ""
+        self.ltp_error = ""
         self.ltp = None                 # last traded price, from the ticker endpoint
         self.prev_ltp = None
         self.last_update = 0.0          # wall clock of the last book update, any source
@@ -222,11 +229,13 @@ def fetch_ltp(headers):
         for key in ("close", "last_price", "mark_price", "spot_price"):
             if result.get(key) not in (None, ""):
                 ltp = float(result[key])
+                mobile_pipeline.ltp_error = ""
                 if ltp != mobile_pipeline.ltp:
                     mobile_pipeline.prev_ltp = mobile_pipeline.ltp
                 mobile_pipeline.ltp = ltp
                 return
     except Exception as exc:
+        mobile_pipeline.ltp_error = f"{type(exc).__name__}: {exc}"[:70]
         print(f"[LTP ERROR] {type(exc).__name__}: {exc}", flush=True)
 
 
@@ -234,11 +243,12 @@ def poll_rest():
     """Poll the REST order book whenever the websocket is not delivering."""
     url = REST_URL.format(symbol=SYMBOL)
     headers = {"Accept": "application/json", "User-Agent": "orderflow-dashboard/1.0"}
+    delay = REST_INTERVAL
     while True:
         # Everything is inside the guard: this is the last line of defence, and a
         # thread that dies here takes the fallback down for the process lifetime.
         try:
-            time.sleep(REST_INTERVAL)
+            time.sleep(delay)
             fetch_ltp(headers)
 
             req = urllib.request.Request(url, headers=headers)
@@ -253,9 +263,11 @@ def poll_rest():
                 apply_levels("asks", result.get("sell") or [])
                 update_metrics()
             mobile_pipeline.rest_error = ""
+            delay = REST_INTERVAL
         except Exception as exc:
+            delay = min(delay * 2, REST_MAX_BACKOFF)
             mobile_pipeline.rest_error = f"{type(exc).__name__}: {exc}"[:70]
-            print(f"[REST ERROR] {type(exc).__name__}: {exc}", flush=True)
+            print(f"[REST ERROR] retry in {delay:.1f}s: {type(exc).__name__}: {exc}", flush=True)
 
 
 def watchdog():
@@ -301,7 +313,30 @@ def ws_forever():
         time.sleep(5)
 
 
-WORKERS = (("ws", ws_forever), ("watchdog", watchdog), ("rest", poll_rest))
+def keepalive():
+    """Request our own public URL so Render sees inbound traffic and stays up.
+
+    Only inbound requests count towards Render's idle timer, so calls out to the
+    exchange do not help. This cannot wake an instance that has already been put
+    to sleep -- nothing running inside it is left to make the call -- so it keeps
+    a live instance alive rather than resurrecting a dead one.
+    """
+    if not KEEPALIVE_URL:
+        print("[KEEPALIVE] no RENDER_EXTERNAL_URL or KEEPALIVE_URL set; disabled", flush=True)
+        return
+    headers = {"User-Agent": "orderflow-dashboard-keepalive/1.0"}
+    while True:
+        time.sleep(KEEPALIVE_EVERY)
+        try:
+            req = urllib.request.Request(KEEPALIVE_URL, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                print(f"[KEEPALIVE] {KEEPALIVE_URL} -> {resp.status}", flush=True)
+        except Exception as exc:
+            print(f"[KEEPALIVE ERROR] {type(exc).__name__}: {exc}", flush=True)
+
+
+WORKERS = (("ws", ws_forever), ("watchdog", watchdog), ("rest", poll_rest),
+           ("keepalive", keepalive))
 _threads = {}
 _threads_lock = threading.Lock()
 
@@ -369,6 +404,25 @@ CELL = {"padding": "3px 10px", "fontVariantNumeric": "tabular-nums",
         "fontFamily": "ui-monospace, Menlo, monospace", "fontSize": "12px"}
 HEAD = dict(CELL, color="#787b86", fontSize="10px", letterSpacing="0.06em",
             borderBottom="1px solid #2a2e39", textAlign="right")
+
+
+def waiting_figure(ws_state, rest_error, ltp_error):
+    """Hold the page's shape and say why it is empty, rather than collapsing."""
+    live = sum(1 for t in _threads.values() if t.is_alive())
+    lines = [f"waiting for market data  ·  pid {os.getpid()}  ·  {live}/{len(WORKERS)} feed threads",
+             f"websocket: {ws_state}"]
+    lines.append(f"order book: {rest_error}" if rest_error else "order book: polling")
+    lines.append(f"last price: {ltp_error}" if ltp_error else "last price: polling")
+
+    fig = go.Figure()
+    fig.add_annotation(text="<br>".join(lines), showarrow=False, xref="paper", yref="paper",
+                       x=0.5, y=0.5, align="left",
+                       font=dict(size=12, color="#787b86", family="ui-monospace, monospace"))
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
+                      height=540, margin=dict(l=8, r=40, t=5, b=5), showlegend=False)
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    return fig
 
 
 def format_ltp(ltp, prev_ltp):
@@ -460,14 +514,15 @@ def refresh_mobile_view(n):
         ws_state = mobile_pipeline.ws_state
         age = time.time() - mobile_pipeline.last_update if mobile_pipeline.last_update else None
         rest_error = mobile_pipeline.rest_error
+        ltp_error = mobile_pipeline.ltp_error
         ltp, prev_ltp = mobile_pipeline.ltp, mobile_pipeline.prev_ltp
 
     ltp_text, ltp_style, ltp_delta = format_ltp(ltp, prev_ltp)
     table = dom_table(bids, asks)
 
     if not times:
-        return (f"BUFFERING · {ws_state}", {"color": "#db8c02"},
-                go.Figure().update_layout(template="plotly_dark"),
+        return (f"WAITING · {ws_state}", {"color": "#db8c02"},
+                waiting_figure(ws_state, rest_error, ltp_error),
                 ltp_text, ltp_style, ltp_delta, table)
 
     last_price = cl[-1]
