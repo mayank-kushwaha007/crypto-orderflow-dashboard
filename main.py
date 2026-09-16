@@ -61,10 +61,12 @@ GIT_COMMIT = (os.environ.get("RENDER_GIT_COMMIT")
 DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
-# Browser update interval. Each frame is ~28KB, so 500ms is about 200MB/hour on
-# a mobile connection; raise this if that matters more than smoothness.
-REFRESH_RATE_MS = int(os.environ.get("REFRESH_RATE_MS", "500"))
-FETCH_TIMEOUT_MS = max(4000, REFRESH_RATE_MS * 8)   # Abort a hung frame fetch
+# Browser update interval. A gzipped frame is ~1.6KB, so 1000ms needs about
+# 1.6KB/s: within reach of a slow mobile link, where 500ms was not.
+REFRESH_RATE_MS = int(os.environ.get("REFRESH_RATE_MS", "1000"))
+# Four intervals, so a stalled request releases its slot promptly rather than
+# holding it for most of a minute at the slower cadence.
+FETCH_TIMEOUT_MS = max(4000, REFRESH_RATE_MS * 4)   # Abort a hung frame fetch
 STALL_RELOAD = 8        # Consecutive failed fetches before reloading the page
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
 # Candles are kept in UTC and converted for display only, so what is stored stays
