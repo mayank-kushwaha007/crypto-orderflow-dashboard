@@ -35,7 +35,8 @@ REST_MAX_BACKOFF = 8.0  # Failures back off to here, then recover on success
 
 # Render kills a free instance after ~15 minutes without INBOUND traffic.
 # Outbound calls do not count, so the service requests its own public URL.
-KEEPALIVE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEPALIVE_URL", "")
+_BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEPALIVE_URL", "")
+KEEPALIVE_URL = (_BASE_URL.rstrip("/") + "/health") if _BASE_URL else ""
 KEEPALIVE_EVERY = 600   # 10 minutes, comfortably inside the 15 minute window
 DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
@@ -368,6 +369,38 @@ ensure_workers()
 # =====================================================================
 app = dash.Dash(__name__, title=f"TradingView Mobile Terminal")
 server = app.server
+
+
+@server.route("/health")
+def health():
+    """Cheap liveness probe for an external pinger, and a status readout.
+
+    Serving this is far lighter than rendering the whole page, and it doubles as
+    the hook that starts this worker's feed: a ping keeps the process both awake
+    and collecting, not merely awake.
+    """
+    ensure_workers()
+    with mobile_pipeline.lock:
+        bids = len(mobile_pipeline.order_book["bids"])
+        asks = len(mobile_pipeline.order_book["asks"])
+        last_update = mobile_pipeline.last_update
+        ltp = mobile_pipeline.ltp
+        ws_state = mobile_pipeline.ws_state
+        rest_error = mobile_pipeline.rest_error
+
+    age = round(time.time() - last_update, 1) if last_update else None
+    payload = {
+        "status": "ok" if age is not None and age < STALE_AFTER else "stale",
+        "symbol": SYMBOL,
+        "ltp": ltp,
+        "book": {"bids": bids, "asks": asks},
+        "seconds_since_update": age,
+        "websocket": ws_state,
+        "rest_error": rest_error or None,
+        "pid": os.getpid(),
+        "threads": sorted(n for n, t in _threads.items() if t.is_alive()),
+    }
+    return json.dumps(payload), 200, {"Content-Type": "application/json"}
 
 app.layout = html.Div(
     style={"backgroundColor": "#131722", "color": "#d1d4dc", "fontFamily": "sans-serif", "padding": "5px"},
