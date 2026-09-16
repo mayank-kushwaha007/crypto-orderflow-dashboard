@@ -61,6 +61,7 @@ class MobileTerminalEngine:
         self.prev_best_ask_price = None
         self.prev_best_ask_size = 0.0
         self.cumulative_ofi = 0.0
+        self.session_day = None         # UTC day the cumulative total belongs to
         
         # Microscopic dynamic memory stacks
         self.timestamps = deque(maxlen=MAX_HISTORY)
@@ -152,13 +153,26 @@ def update_metrics():
     dAsk = best_ask_sz if mobile_pipeline.prev_best_ask_price is None or best_ask < mobile_pipeline.prev_best_ask_price else (best_ask_sz - mobile_pipeline.prev_best_ask_size if best_ask == mobile_pipeline.prev_best_ask_price else -mobile_pipeline.prev_best_ask_size)
     
     step_ofi = dBid - dAsk
-    mobile_pipeline.cumulative_ofi += step_ofi
+
+    # Cumulative OFI is anchored to the UTC day. Measured from process start it
+    # restarts at an invisible moment and is not comparable between days; a
+    # session total is. The open second is closed against the old day's running
+    # figure before the reset, so no bar records a total from the wrong session.
+    day = pd.Timestamp.now(tz="UTC").floor("D")
+    p = mobile_pipeline
+    if p.session_day is not None and day != p.session_day:
+        flush_bucket()
+        p.cur_sec = None
+        p.cumulative_ofi = 0.0
+        print(f"[OFI] new UTC session {day.date()}, cumulative reset to 0", flush=True)
+    p.session_day = day
+
+    p.cumulative_ofi += step_ofi
 
     # Fold this update into the current second rather than emitting a point per
     # message: the feed bursts many updates per second, which collapses the
     # timeline to milliseconds and makes every candle degenerate.
     sec = pd.Timestamp.now().floor(BUCKET)
-    p = mobile_pipeline
 
     if p.cur_sec is None:
         p.cur_sec = sec
@@ -367,9 +381,14 @@ def restore_history():
             p.prices.append(c)
             p.ofi_steps.append(step)
             p.ofi_history.append(cum)
-        p.cumulative_ofi = rows[-1][6]   # continue the running total
+        # Resume the total only within the same UTC day; across a boundary the
+        # session has ended and today starts from zero.
+        today = pd.Timestamp.now(tz="UTC").floor("D")
+        last_day = pd.Timestamp(rows[-1][0]).tz_convert("UTC").floor("D")
+        p.session_day = today
+        p.cumulative_ofi = rows[-1][6] if last_day == today else 0.0
     print(f"[DB] restored {len(rows)} candles, cumulative OFI resumes at "
-          f"{p.cumulative_ofi:+,.0f}", flush=True)
+          f"{p.cumulative_ofi:+,.0f} for UTC {p.session_day.date()}", flush=True)
 
 
 def ensure_workers():
@@ -426,6 +445,7 @@ def health():
     payload = {
         "status": "ok" if age is not None and age < STALE_AFTER else "stale",
         "symbol": SYMBOL,
+        "session_day": str(mobile_pipeline.session_day.date()) if mobile_pipeline.session_day else None,
         "ltp": ltp,
         "book": {"bids": bids, "asks": asks},
         "seconds_since_update": age,
@@ -596,7 +616,7 @@ def refresh_mobile_view(n):
 
     last_price = cl[-1]
     ticker_color = "#089981" if ofi_steps_list[-1] >= 0 else "#f23645"
-    ticker_text = f"P: ${last_price:,.1f} | OFI: {current_ofi:+,.0f}"
+    ticker_text = f"P: ${last_price:,.1f} | OFI(D): {current_ofi:+,.0f}"
 
     # Without this a dead feed is indistinguishable from a quiet market: the
     # page keeps redrawing the same last candle and looks alive.
