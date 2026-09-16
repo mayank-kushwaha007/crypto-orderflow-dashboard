@@ -561,6 +561,36 @@ app = LiveDash(__name__, title=f"TradingView Mobile Terminal")
 server = app.server
 
 
+@server.after_request
+def compress(response):
+    """Gzip every text response, not just the frame.
+
+    Only /api/frame was compressed, so a page reload cost about 26KB: 16KB of
+    HTML and 9KB of layout, uncompressed. On a 3KB/s link that is nine seconds
+    of blank screen, and the stall recovery reloads the page — so the recovery
+    was manufacturing the very gaps it was meant to repair.
+    """
+    if (response.direct_passthrough
+            or response.status_code < 200 or response.status_code >= 300
+            or "Content-Encoding" in response.headers
+            or "gzip" not in (request.headers.get("Accept-Encoding") or "")):
+        return response
+
+    ctype = response.headers.get("Content-Type", "")
+    if not any(t in ctype for t in ("text/", "json", "javascript")):
+        return response
+
+    body = response.get_data()
+    if len(body) < 500:          # below this the header overhead is not worth it
+        return response
+
+    response.set_data(gzip.compress(body, 6))
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = len(response.get_data())
+    response.headers.add("Vary", "Accept-Encoding")
+    return response
+
+
 @server.route("/api/frame")
 def api_frame():
     """Everything the page needs, as one GET.
@@ -591,18 +621,8 @@ def api_frame():
     # PlotlyJSONEncoder is what Dash serialises layouts with: it recurses into
     # nested components. to_plotly_json() only converts the outermost one, and a
     # default=str fallback then stringifies the children into useless text.
-    body = json.dumps(payload, cls=PlotlyJSONEncoder)
-    headers = {"Content-Type": "application/json", "Cache-Control": "no-store"}
-
-    # The frame is highly repetitive -- every ladder cell carries the same inline
-    # style -- so it compresses by about 92%. On a slow mobile link that is the
-    # difference between a frame arriving in half a second and in five.
-    if "gzip" in (request.headers.get("Accept-Encoding") or ""):
-        body = gzip.compress(body.encode(), 6)
-        headers["Content-Encoding"] = "gzip"
-        headers["Vary"] = "Accept-Encoding"
-
-    return body, 200, headers
+    return json.dumps(payload, cls=PlotlyJSONEncoder), 200, {
+        "Content-Type": "application/json", "Cache-Control": "no-store"}
 
 
 @server.route("/health")

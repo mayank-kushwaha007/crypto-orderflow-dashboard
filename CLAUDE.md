@@ -98,6 +98,12 @@ and behaves identically where that path works.
 layouts. `to_plotly_json()` converts only the outermost component, and a `default=str`
 fallback then turns the children into text, so the table arrives as a string.
 
+Every text response is gzipped by an `after_request` hook, not just the frame. When
+only the frame was compressed a page reload cost ~26KB — 16KB of HTML plus 9KB of
+layout — which is nine seconds on a 3KB/s link, and the stall recovery reloads the
+page, so the recovery manufactured the gaps it was meant to repair. Compressed the
+same reload is ~6.8KB, about two seconds.
+
 The frame is gzipped, which matters more than it sounds: the ladder repeats the same
 inline style on all 40 cells, so 21KB of JSON compresses to about 1.6KB. On a 4KB/s
 mobile link that is 0.4s per frame rather than 5.2s, which is the difference between
@@ -133,6 +139,17 @@ when the browser has sent nothing.
 Candles are kept in UTC throughout — in memory and in Postgres — and converted to
 `DISPLAY_TZ` (default `Asia/Kolkata`) only when the axis is drawn. Keep it that
 way: storing local time makes stored data ambiguous across DST and deployments.
+
+## Where a frame's time goes
+
+Measured, median of 50: ingest and OFI aggregation 0.46ms (0.9%), building the Plotly
+figure 44.6ms (92.4%), JSON 3.0ms, gzip 0.2ms. The aggregation is scalar arithmetic on
+a handful of floats — numba or similar would optimise under 1% of the work. If frame
+build ever needs to be faster, the target is Plotly object construction: consolidating
+the sixteen per-level DOM scatter traces into two measured 24.5ms to 19.4ms.
+
+Server CPU has never been the cause of a stall. At ~48ms a frame it cannot produce a
+gap of seconds; look at transport and at reload cost instead.
 
 ## Known rough edges (left deliberately — do not "fix" unprompted)
 
