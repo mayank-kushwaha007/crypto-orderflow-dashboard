@@ -3,9 +3,19 @@
 A Dash app for order flow imbalance (OFI) and DOM level-2 order cluster analysis,
 fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Render.
 
-- `main.py` — the entire app: websocket ingestion, OFI accounting, Dash layout and chart callback.
+- `main.py` — websocket and REST ingestion, OFI accounting, Dash layout and callback.
+- `storage.py` — optional Postgres persistence for completed candles.
 - `requirements.txt` — dependencies (unpinned).
 - No test suite, no CI.
+
+## Environment
+
+- `DATABASE_URL` — Postgres connection string. **Unset is a supported mode**: storage
+  goes inert and the app behaves exactly as it did before. Never make persistence
+  load-bearing for the live chart.
+- `RENDER_EXTERNAL_URL` — set by Render; the keepalive requests it every 10 minutes.
+  Only inbound traffic resets Render's idle timer, so calls to the exchange do not
+  keep the instance up.
 
 ## Working agreement
 
@@ -49,6 +59,13 @@ confirmed from the Render logs instead — do not guess at socket URLs.
 - **Multiple gunicorn workers each keep their own order book** and their own websocket
   connection, so consecutive refreshes read from different books. This app wants
   `--workers 1`.
+- **Threads do not survive `fork()`.** Under `gunicorn --preload` the module is
+  imported in the master and the workers are forked from it, so threads started at
+  import exist only in the master and every worker serves a frozen snapshot. Start
+  them through `ensure_workers()`, which the callback and `/health` both call.
+- **Liveness must not depend on the component that fails.** The REST poller once
+  stood down whenever the socket had "recently" delivered, so a socket that went
+  quiet froze the book while the poller judged it healthy.
 
 ## Conventions
 
