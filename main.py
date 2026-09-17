@@ -7,7 +7,6 @@ import time
 from collections import deque
 import websocket
 import pandas as pd
-import numpy as np
 
 import storage
 
@@ -23,7 +22,7 @@ from plotly.subplots import make_subplots
 # CONFIGURATION
 # =====================================================================
 # Tried in order. A connection that yields no book data is abandoned for the
-# next one, so a wrong endpoint self-corrects instead of sitting there connected.
+# next one, so a wrong endpoint self-corrects.
 SOCKET_URLS = [
     "wss://socket.india.delta.exchange",
     "wss://socket.delta.exchange",
@@ -32,7 +31,7 @@ SOCKET_URLS = [
 STALL_SECONDS = 25      # No book data this long after connecting -> try the next URL
 
 # REST fallback. The websocket needs a channel subscription the venue can refuse;
-# this endpoint needs none, so it keeps the chart alive when the socket will not.
+# this endpoint needs none.
 REST_URL = "https://api.india.delta.exchange/v2/l2orderbook/{symbol}?depth=20"
 TICKER_URL = "https://api.india.delta.exchange/v2/tickers/{symbol}"
 REST_INTERVAL = 0.5     # REST is the primary source, polled continuously
@@ -44,38 +43,33 @@ _BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEPALIVE_U
 KEEPALIVE_URL = (_BASE_URL.rstrip("/") + "/health") if _BASE_URL else ""
 KEEPALIVE_EVERY = 600   # 10 minutes, comfortably inside the 15 minute window
 
-# The layout is rendered per request, so reloading the page is a real refresh.
-# This drives live updates where the in-place callback is not reaching the
-# browser. Set to 0 to disable it and rely on the callback alone.
+# The layout is rendered per request, so a reload is a real refresh. It drives
+# updates only where the in-place callback is not arriving; 0 disables it.
 AUTO_REFRESH_SECONDS = int(os.environ.get("AUTO_REFRESH_SECONDS", "5"))
 
-# Persistence. Unset DATABASE_URL and everything below degrades to the previous
-# in-memory-only behaviour rather than failing.
+# Persistence. Unset means storage goes inert, not that anything fails.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# Render sets RENDER_GIT_COMMIT on every deploy. Reporting it makes "is the
-# running code current?" answerable from the page instead of by inference.
+# Render sets RENDER_GIT_COMMIT on every deploy, so the page can report which
+# commit it is running.
 GIT_COMMIT = (os.environ.get("RENDER_GIT_COMMIT")
               or os.environ.get("GIT_COMMIT", "local"))[:7]
 DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
-# Browser update interval. A gzipped frame is ~1.6KB, so 1000ms needs about
-# 1.6KB/s; 5000ms needs a fifth of that, leaving the link idle between frames
-# instead of always part way through one.
+# Browser update interval. A gzipped frame is ~1.6KB, so 5000ms costs about
+# 0.32KB/s.
 REFRESH_RATE_MS = int(os.environ.get("REFRESH_RATE_MS", "5000"))
-# Four intervals, so a stalled request releases its slot promptly rather than
-# holding it for most of a minute at the slower cadence. Capped, since four
-# five second intervals would hold a dead slot for twenty seconds.
-FETCH_TIMEOUT_MS = min(10000, max(4000, REFRESH_RATE_MS * 4))   # Abort a hung frame fetch
-# A callback this recent means in-place updates are working. It must exceed one
-# interval, or at the slower cadence the check flaps between ticks and the
-# reload tag comes back on a page that is updating perfectly well.
+# Abort a hung frame fetch: four intervals, capped so a slow cadence cannot
+# hold a dead request slot for twenty seconds.
+FETCH_TIMEOUT_MS = min(10000, max(4000, REFRESH_RATE_MS * 4))
+# A callback this recent means in-place updates are working. Must exceed one
+# interval, or the check flaps between ticks and re-arms the reload tag.
 CALLBACK_FRESH = max(5.0, REFRESH_RATE_MS / 1000.0 * 2)
 STALL_RELOAD = 8        # Consecutive failed fetches before reloading the page
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
-# Candles are kept in UTC and converted for display only, so what is stored stays
-# unambiguous while the axis reads in the viewer's own time.
+# Candles are kept in UTC and converted for display only, so stored data stays
+# unambiguous across DST and deployments.
 DISPLAY_TZ = os.environ.get("DISPLAY_TZ", "Asia/Kolkata")
 STALE_AFTER = 5         # Seconds without a book update before the ticker says so
 
@@ -83,20 +77,19 @@ class MobileTerminalEngine:
     def __init__(self):
         self.lock = threading.Lock()
         self.order_book = {"bids": {}, "asks": {}}
-        
+
         self.prev_best_bid_price = None
         self.prev_best_bid_size = 0.0
         self.prev_best_ask_price = None
         self.prev_best_ask_size = 0.0
         self.cumulative_ofi = 0.0
         self.session_day = None         # UTC day the cumulative total belongs to
-        
-        # Microscopic dynamic memory stacks
+
         self.timestamps = deque(maxlen=MAX_HISTORY)
         self.prices = deque(maxlen=MAX_HISTORY)
         self.ofi_history = deque(maxlen=MAX_HISTORY)
         self.ofi_steps = deque(maxlen=MAX_HISTORY)
-        
+
         # Candle currently being accumulated for the present second
         self.cur_sec = None
         self.cur_open = None
@@ -112,7 +105,7 @@ class MobileTerminalEngine:
         self.conn_started = 0.0
         self.rest_error = ""
         self.ltp_error = ""
-        self.callbacks = 0              # renders served, to tell client from server
+        self.callbacks = 0              # frames served to the browser
         self.last_callback = 0.0
         self.render_error = ""
         self.ltp = None                 # last traded price, from the ticker endpoint
@@ -129,7 +122,7 @@ mobile_pipeline = MobileTerminalEngine()
 store = storage.Storage(DATABASE_URL, SYMBOL)
 
 # =====================================================================
-# BACKGROUND DATA INGESTION MATRIX
+# DATA INGESTION
 # =====================================================================
 def parse_level(level):
     """Delta sends a level either as ["price", "size"] or as
@@ -177,18 +170,17 @@ def update_metrics():
     best_bid_sz = mobile_pipeline.order_book["bids"][best_bid]
     best_ask = min(mobile_pipeline.order_book["asks"].keys())
     best_ask_sz = mobile_pipeline.order_book["asks"][best_ask]
-    
+
     mid_price = (best_bid + best_ask) / 2.0
 
     dBid = best_bid_sz if mobile_pipeline.prev_best_bid_price is None or best_bid > mobile_pipeline.prev_best_bid_price else (best_bid_sz - mobile_pipeline.prev_best_bid_size if best_bid == mobile_pipeline.prev_best_bid_price else -mobile_pipeline.prev_best_bid_size)
     dAsk = best_ask_sz if mobile_pipeline.prev_best_ask_price is None or best_ask < mobile_pipeline.prev_best_ask_price else (best_ask_sz - mobile_pipeline.prev_best_ask_size if best_ask == mobile_pipeline.prev_best_ask_price else -mobile_pipeline.prev_best_ask_size)
-    
+
     step_ofi = dBid - dAsk
 
-    # Cumulative OFI is anchored to the UTC day. Measured from process start it
-    # restarts at an invisible moment and is not comparable between days; a
-    # session total is. The open second is closed against the old day's running
-    # figure before the reset, so no bar records a total from the wrong session.
+    # Cumulative OFI is a UTC daily session total. The open second is closed
+    # against the old day's running figure before the reset, so no bar records a
+    # total from the wrong session.
     day = pd.Timestamp.now(tz="UTC").floor("D")
     p = mobile_pipeline
     if p.session_day is not None and day != p.session_day:
@@ -201,8 +193,7 @@ def update_metrics():
     p.cumulative_ofi += step_ofi
 
     # Fold this update into the current second rather than emitting a point per
-    # message: the feed bursts many updates per second, which collapses the
-    # timeline to milliseconds and makes every candle degenerate.
+    # message: the feed bursts many updates per second.
     sec = pd.Timestamp.now(tz="UTC").floor(BUCKET)
 
     if p.cur_sec is None:
@@ -257,8 +248,7 @@ def on_message(ws, message):
 
 
 def on_open(ws):
-    # Sent as separate frames: if the venue rejects one channel name, the
-    # other still gets through rather than the whole subscribe failing.
+    # Separate frames, so a rejected channel name does not fail the other.
     for name in ("l2_updates", "l2_orderbook"):
         payload = {"type": "subscribe", "payload": {"channels": [{"name": name, "symbols": [SYMBOL]}]}}
         ws.send(json.dumps(payload))
@@ -301,8 +291,8 @@ def poll_rest():
     headers = {"Accept": "application/json", "User-Agent": "orderflow-dashboard/1.0"}
     delay = REST_INTERVAL
     while True:
-        # Everything is inside the guard: this is the last line of defence, and a
-        # thread that dies here takes the fallback down for the process lifetime.
+        # Everything inside the guard: a thread that dies here takes the
+        # fallback down for the process lifetime.
         try:
             time.sleep(delay)
             fetch_ltp(headers)
@@ -361,7 +351,7 @@ def ws_forever():
             print(f"[WS LOOP ERROR] {exc}", flush=True)
 
         # Judge this connection alone: an endpoint that delivered before but
-        # sent nothing this time must still be rotated away from.
+        # sent nothing this time is still rotated away from.
         if mobile_pipeline.last_ws_data < mobile_pipeline.conn_started:
             mobile_pipeline.url_index = (mobile_pipeline.url_index + 1) % len(SOCKET_URLS)
         mobile_pipeline.ws_state = "reconnecting"
@@ -372,10 +362,9 @@ def ws_forever():
 def keepalive():
     """Request our own public URL so Render sees inbound traffic and stays up.
 
-    Only inbound requests count towards Render's idle timer, so calls out to the
-    exchange do not help. This cannot wake an instance that has already been put
-    to sleep -- nothing running inside it is left to make the call -- so it keeps
-    a live instance alive rather than resurrecting a dead one.
+    Only inbound requests reset Render's idle timer, so calls out to the exchange
+    do not help. It keeps a live instance alive; it cannot wake a sleeping one,
+    since nothing inside it is left to make the call.
     """
     if not KEEPALIVE_URL:
         _retired.add("keepalive")       # deliberate exit, not a crash to restart
@@ -427,17 +416,15 @@ def restore_history():
 def ensure_workers():
     """Start the feed threads in THIS process, and restart any that have died.
 
-    Threads do not survive fork(). Under `gunicorn --preload` the module is
-    imported once in the master and the workers are forked from it, so threads
-    started at import exist only in the master: every worker then serves the
-    snapshot captured at fork time and never updates again. Calling this from
-    the callback as well as at import means whichever process answers requests
-    is always the one running the feed.
+    Threads do not survive fork(), so threads started at import exist only in a
+    `gunicorn --preload` master and every forked worker serves a frozen
+    snapshot. Calling this from the request path as well as at import keeps the
+    process that answers requests the one running the feed.
     """
     if store.enabled and not store._started:
         store.start()
-        # Off the request path: restore_history() connects and queries, and a slow
-        # or unreachable database would otherwise stall every callback behind it.
+        # Off the request path: a slow or unreachable database would otherwise
+        # stall every callback behind it.
         threading.Thread(target=restore_history, name="restore", daemon=True).start()
 
     with _threads_lock:
@@ -455,7 +442,7 @@ def ensure_workers():
 ensure_workers()
 
 # =====================================================================
-# DASH PRESENTATION CONTAINER SETUP
+# PRESENTATION
 # =====================================================================
 CELL = {"padding": "3px 10px", "fontVariantNumeric": "tabular-nums",
         "fontFamily": "ui-monospace, Menlo, monospace", "fontSize": "12px"}
@@ -536,7 +523,6 @@ def dom_table(bids, asks):
         ])
 
 
-
 def callbacks_arriving():
     """True when the in-place update callback has run recently enough to drive
     the page on its own."""
@@ -547,10 +533,9 @@ def callbacks_arriving():
 class LiveDash(dash.Dash):
     """Emits the reload meta tag only while the update callback is not arriving.
 
-    Where the callback works -- a laptop, a local run, another Dash project --
-    the tag is absent and the page updates in place as Dash intends. Where it
-    does not, the reload keeps the page live rather than frozen. The decision is
-    made per page load, so it corrects itself in both directions.
+    Where the callback works the tag is absent and the page updates in place, as
+    Dash intends. The decision is made per page load, so it corrects itself in
+    both directions.
     """
 
     def interpolate_index(self, **kwargs):
@@ -562,7 +547,7 @@ class LiveDash(dash.Dash):
         return doc
 
 
-app = LiveDash(__name__, title=f"TradingView Mobile Terminal")
+app = LiveDash(__name__, title="TradingView Mobile Terminal")
 server = app.server
 
 
@@ -570,10 +555,8 @@ server = app.server
 def compress(response):
     """Gzip every text response, not just the frame.
 
-    Only /api/frame was compressed, so a page reload cost about 26KB: 16KB of
-    HTML and 9KB of layout, uncompressed. On a 3KB/s link that is nine seconds
-    of blank screen, and the stall recovery reloads the page — so the recovery
-    was manufacturing the very gaps it was meant to repair.
+    A page reload is ~26KB uncompressed and ~6.8KB gzipped, which on a 3KB/s
+    link is the difference between nine seconds of blank screen and two.
     """
     if (response.direct_passthrough
             or response.status_code < 200 or response.status_code >= 300
@@ -598,18 +581,12 @@ def compress(response):
 
 @server.route("/api/frame")
 def api_frame():
-    """Everything the page needs, as one GET.
-
-    The update callback posts to _dash-update-component and that POST is not
-    reaching this deployment, while every GET does. This carries the same payload
-    over a plain GET so the page can update itself in place.
-    """
+    """Everything the page needs, as one GET."""
     mobile_pipeline.callbacks += 1
     mobile_pipeline.last_callback = time.time()
 
     ticker, ticker_style, fig, ltp, ltp_style, delta, table = _safe_render(0)
-    # The Plotly template is ~8KB, static, and already established by the first
-    # render. Resending it on every frame is most of the payload on a slow link.
+    # The template is ~8KB, static, and already established by the first render.
     fig_json = fig.to_plotly_json()
     fig_json.get("layout", {}).pop("template", None)
 
@@ -623,9 +600,8 @@ def api_frame():
         "ltp_delta": delta,
         "table": table,
     }
-    # PlotlyJSONEncoder is what Dash serialises layouts with: it recurses into
-    # nested components. to_plotly_json() only converts the outermost one, and a
-    # default=str fallback then stringifies the children into useless text.
+    # PlotlyJSONEncoder recurses into nested components, which is what the table
+    # needs. to_plotly_json() converts only the outermost one.
     return json.dumps(payload, cls=PlotlyJSONEncoder), 200, {
         "Content-Type": "application/json", "Cache-Control": "no-store"}
 
@@ -634,9 +610,8 @@ def api_frame():
 def health():
     """Cheap liveness probe for an external pinger, and a status readout.
 
-    Serving this is far lighter than rendering the whole page, and it doubles as
-    the hook that starts this worker's feed: a ping keeps the process both awake
-    and collecting, not merely awake.
+    Far lighter than rendering the page, and it starts this worker's feed, so a
+    ping keeps the process collecting rather than merely awake.
     """
     ensure_workers()
     with mobile_pipeline.lock:
@@ -690,10 +665,9 @@ def callback_badge():
 def serve_layout():
     """Rendered on every page load, so a reload always reflects current state.
 
-    Built once at import, the seeded values froze at process start: the panel
-    read "websocket: starting" indefinitely and a reload could never show live
-    data, however healthy the feed was. As a function it also means the page is
-    useful even when the update callback is not reaching the browser.
+    Must stay a callable: built once at import it would freeze at the values
+    seeded at process start. It also keeps the page useful where the update
+    callback is not reaching the browser.
     """
     ticker, ticker_style, fig, ltp, ltp_style, delta, table = _safe_render(0)
 
@@ -732,27 +706,23 @@ def serve_layout():
     )
 
 # =====================================================================
-# RENDERING PIPELINE CONTROLLER CALLBACK
+# UPDATE CALLBACK
 # =====================================================================
 # Updates run clientside, fetching /api/frame over GET, rather than through the
-# server callback's POST to _dash-update-component. Both are ordinary Dash; this
-# one simply does not depend on the request path that is failing on this
-# deployment, and behaves identically where that path works.
+# server callback's POST to _dash-update-component. Both are ordinary Dash and
+# behave identically where the POST path works.
 app.clientside_callback(
     """
     function(n) {
         var blank = Array(8).fill(window.dash_clientside.no_update);
 
-        // One request in flight at a time. The interval fires regardless of
-        // whether the last frame arrived, so on a slow link requests otherwise
-        // pile up and saturate the very connection they are waiting on: a
-        // twelve second stall produced twenty-four overlapping fetches in
-        // testing. Skipping a tick is cheaper than competing with itself.
+        // One request in flight at a time. The interval fires whether or not
+        // the last frame arrived, so on a slow link requests otherwise pile up
+        // and saturate the connection they are waiting on.
         if (window._ofBusy) { return blank; }
         window._ofBusy = true;
 
-        // Bound each attempt as well, so a request that never settles releases
-        // the slot instead of holding it for good.
+        // Bound each attempt, so a request that never settles releases the slot.
         var ctl = new AbortController();
         var timer = setTimeout(function () { ctl.abort(); }, %(timeout)d);
 
@@ -768,7 +738,7 @@ app.clientside_callback(
             .catch(function () {
                 clearTimeout(timer);
                 window._ofBusy = false;
-                // The reload fallback stood down while frames were arriving, so
+                // The reload fallback stands down while frames are arriving, so
                 // a client that stalls afterwards has nothing else to recover it.
                 window._ofStall = (window._ofStall || 0) + 1;
                 if (window._ofStall >= %(stall)d) { window._ofStall = 0; location.reload(); }
@@ -792,8 +762,8 @@ def _safe_render(n):
     try:
         return _render(n)
     except Exception as exc:
-        # Raising here means Dash sends no update at all, and the page sits on
-        # whatever it last drew with nothing to say why. Show the fault instead.
+        # Raising sends no update at all and the page sits on its last draw with
+        # nothing to say why. Show the fault instead.
         mobile_pipeline.render_error = f"{type(exc).__name__}: {exc}"[:120]
         print(f"[RENDER ERROR] {type(exc).__name__}: {exc}", flush=True)
         msg = f"RENDER ERROR · {type(exc).__name__}: {exc}"[:140]
@@ -809,7 +779,7 @@ def _render(n):
         bids = dict(mobile_pipeline.order_book["bids"])
         asks = dict(mobile_pipeline.order_book["asks"])
         current_ofi = mobile_pipeline.cumulative_ofi
-        
+
         times = list(mobile_pipeline.timestamps)
         op, hi, lo, cl = list(mobile_pipeline.opens), list(mobile_pipeline.highs), list(mobile_pipeline.lows), list(mobile_pipeline.closes)
         ofi_steps_list = list(mobile_pipeline.ofi_steps)
@@ -830,8 +800,8 @@ def _render(n):
         ltp_error = mobile_pipeline.ltp_error
         ltp, prev_ltp = mobile_pipeline.ltp, mobile_pipeline.prev_ltp
 
-    # Converted here, before anything is plotted: the series is kept in UTC and
-    # only the axis reads in local time.
+    # Converted before anything is plotted: the series is kept in UTC and only
+    # the axis reads in local time.
     times = [t.tz_convert(DISPLAY_TZ) for t in times]
 
     ltp_text, ltp_style, ltp_delta = format_ltp(ltp, prev_ltp)
@@ -846,15 +816,15 @@ def _render(n):
     ticker_color = "#089981" if ofi_steps_list[-1] >= 0 else "#f23645"
     ticker_text = f"P: ${last_price:,.1f} | OFI(D): {current_ofi:+,.0f}"
 
-    # Without this a dead feed is indistinguishable from a quiet market: the
-    # page keeps redrawing the same last candle and looks alive.
+    # Without this a dead feed looks like a quiet market: the page keeps
+    # redrawing the same last candle.
     if age is not None and age > STALE_AFTER:
         ticker_text += f" | STALE {age:,.0f}s"
         if rest_error: ticker_text += f" | REST {rest_error}"
         ticker_color = "#db8c02"
 
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, 
+        rows=2, cols=1, shared_xaxes=True,
         vertical_spacing=0.03, row_heights=[0.80, 0.20]
     )
 
@@ -868,9 +838,9 @@ def _render(n):
     if bids and asks:
         sorted_bids = sorted(bids.items(), key=lambda x: x[0], reverse=True)[:8]
         sorted_asks = sorted(asks.items(), key=lambda x: x[0])[:8]
-        
+
         max_size = max([s for p, s in sorted_bids + sorted_asks] + [1.0])
-        
+
         for price, size in sorted_bids:
             scaled_marker = int((size / max_size) * 28) + 6
             fig.add_trace(go.Scatter(
@@ -898,10 +868,10 @@ def _render(n):
         paper_bgcolor="#131722",
         plot_bgcolor="#131722",
         xaxis_rangeslider_visible=False,
-        height=540,  
-        margin=dict(l=8, r=40, t=5, b=5), 
+        height=540,
+        margin=dict(l=8, r=40, t=5, b=5),
         showlegend=False,
-        uirevision='constant' 
+        uirevision='constant'
     )
 
     pad = pd.Timedelta(seconds=1)
@@ -910,28 +880,28 @@ def _render(n):
                      range=xr, row=1, col=1)
     fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", tickfont=dict(size=10),
                      range=xr, row=2, col=1)
-    
+
     fig.update_yaxes(
-        showgrid=True, gridcolor="#2a2e39", 
-        side="right", tickfont=dict(size=10), 
+        showgrid=True, gridcolor="#2a2e39",
+        side="right", tickfont=dict(size=10),
         autorange=True, row=1, col=1
     )
     fig.update_yaxes(
-        showgrid=True, gridcolor="#2a2e39", 
-        side="right", tickfont=dict(size=8), 
+        showgrid=True, gridcolor="#2a2e39",
+        side="right", tickfont=dict(size=8),
         autorange=True, row=2, col=1
     )
 
     return (ticker_text, {"color": ticker_color}, fig,
             ltp_text, ltp_style, ltp_delta, table)
 
-# Assigned here rather than beside the definition: Dash evaluates the callable
-# immediately to validate it, and it renders through refresh_mobile_view below.
+# Assigned after the callback, not beside serve_layout: Dash evaluates the
+# callable immediately and it renders through _safe_render above.
 app.layout = serve_layout
 
 
 # =====================================================================
-# CLOUD PRODUCTION SERVICE DEPLOYMENT RUN ENGINE
+# LOCAL RUN
 # =====================================================================
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 8050)))
