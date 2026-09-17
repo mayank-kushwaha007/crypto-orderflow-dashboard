@@ -48,7 +48,6 @@ KEEPALIVE_EVERY = 600   # 10 minutes, comfortably inside the 15 minute window
 # This drives live updates where the in-place callback is not reaching the
 # browser. Set to 0 to disable it and rely on the callback alone.
 AUTO_REFRESH_SECONDS = int(os.environ.get("AUTO_REFRESH_SECONDS", "5"))
-CALLBACK_FRESH = 5.0    # A callback this recent means in-place updates are working
 
 # Persistence. Unset DATABASE_URL and everything below degrades to the previous
 # in-memory-only behaviour rather than failing.
@@ -62,11 +61,17 @@ DOM_ROWS = 10           # Depth levels shown in the bid/ask table
 SYMBOL = "BTCUSD"
 MAX_HISTORY = 40        # Optimized timeline length for vertical mobile viewports
 # Browser update interval. A gzipped frame is ~1.6KB, so 1000ms needs about
-# 1.6KB/s: within reach of a slow mobile link, where 500ms was not.
-REFRESH_RATE_MS = int(os.environ.get("REFRESH_RATE_MS", "1000"))
+# 1.6KB/s; 5000ms needs a fifth of that, leaving the link idle between frames
+# instead of always part way through one.
+REFRESH_RATE_MS = int(os.environ.get("REFRESH_RATE_MS", "5000"))
 # Four intervals, so a stalled request releases its slot promptly rather than
-# holding it for most of a minute at the slower cadence.
-FETCH_TIMEOUT_MS = max(4000, REFRESH_RATE_MS * 4)   # Abort a hung frame fetch
+# holding it for most of a minute at the slower cadence. Capped, since four
+# five second intervals would hold a dead slot for twenty seconds.
+FETCH_TIMEOUT_MS = min(10000, max(4000, REFRESH_RATE_MS * 4))   # Abort a hung frame fetch
+# A callback this recent means in-place updates are working. It must exceed one
+# interval, or at the slower cadence the check flaps between ticks and the
+# reload tag comes back on a page that is updating perfectly well.
+CALLBACK_FRESH = max(5.0, REFRESH_RATE_MS / 1000.0 * 2)
 STALL_RELOAD = 8        # Consecutive failed fetches before reloading the page
 BUCKET = "1s"           # Candles aggregate every update within one wall-clock second
 # Candles are kept in UTC and converted for display only, so what is stored stays
