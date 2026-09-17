@@ -1,17 +1,13 @@
 """Durable storage for completed candles.
 
-Everything the dashboard collects lives in memory, so any restart - a deploy, a
-crash, or a free instance spinning down - loses it and sets cumulative OFI back
-to zero. This module writes each completed second to Postgres and reads the
-series back on startup, so the chart resumes where it left off and OFI keeps
-accumulating across restarts.
+Everything the dashboard collects lives in memory, so a restart - a deploy, a
+crash, a free instance spinning down - loses it. This writes each completed
+second to Postgres and reads the series back on startup, so the chart resumes
+and cumulative OFI keeps accumulating across restarts.
 
-Writes are queued and flushed in batches by a background thread: the feed hands
-over a finished candle and carries on, so a slow or unreachable database can
-never stall ingestion. Nothing here raises into the caller.
-
-With DATABASE_URL unset the whole module is inert and the app behaves exactly as
-it did before.
+Writes are queued and flushed in batches by a background thread, so a slow or
+unreachable database can never stall ingestion. Nothing here raises into the
+caller, and with DATABASE_URL unset the whole module is inert.
 """
 
 import os
@@ -67,7 +63,7 @@ ON CONFLICT (symbol, ts) DO UPDATE SET
 """
 
 # Fold expiring seconds into minute bars before deleting them, so history thins
-# out with age instead of disappearing.
+# with age instead of disappearing.
 ROLLUP = """
 INSERT INTO candles_1m (symbol, ts, open, high, low, close, ofi_step, ofi_cum)
 SELECT symbol,
