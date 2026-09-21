@@ -4,7 +4,7 @@ import os
 import urllib.request
 import threading
 import time
-from collections import deque
+from collections import deque, OrderedDict
 import websocket
 import pandas as pd
 
@@ -36,6 +36,16 @@ REST_URL = "https://api.india.delta.exchange/v2/l2orderbook/{symbol}?depth=20"
 TICKER_URL = "https://api.india.delta.exchange/v2/tickers/{symbol}"
 REST_INTERVAL = 0.5     # REST is the primary source, polled continuously
 REST_MAX_BACKOFF = 8.0  # Failures back off to here, then recover on success
+
+# Executed trades, which the book channels do not carry: they carry resting
+# orders. A footprint is built from what actually traded and on which side the
+# aggressor stood, so it needs this feed and nothing else will do. Public and
+# unauthenticated - it is get_public_trades() in Delta's own REST client.
+TRADES_URL = "https://api.india.delta.exchange/v2/trades/{symbol}"
+TRADES_INTERVAL = 1.0
+# Falling back to mid prices after this long without a trade keeps the candles
+# drawing when the trade feed is the thing that broke.
+TRADE_FRESH = 30.0
 
 # Render kills a free instance after ~15 minutes without INBOUND traffic.
 # Outbound calls do not count, so the service requests its own public URL.
@@ -72,6 +82,17 @@ BUCKET = "1s"           # Candles aggregate every update within one wall-clock s
 # unambiguous across DST and deployments.
 DISPLAY_TZ = os.environ.get("DISPLAY_TZ", "Asia/Kolkata")
 STALE_AFTER = 5         # Seconds without a book update before the ticker says so
+
+# Footprint. Each bar is one FOOTPRINT_BUCKET of trades, split into rows
+# FOOTPRINT_TICK wide, showing sell volume x buy volume at that price.
+FOOTPRINT_BUCKET = os.environ.get("FOOTPRINT_BUCKET", "5min")
+FOOTPRINT_TICK = float(os.environ.get("FOOTPRINT_TICK", "50"))
+# Bars are wide: at 400px twelve of them overlap into unreadable mush, five do
+# not. The browser sends its width with the frame request and the server picks.
+FOOTPRINT_BARS = int(os.environ.get("FOOTPRINT_BARS", "12"))
+FOOTPRINT_BARS_NARROW = int(os.environ.get("FOOTPRINT_BARS_NARROW", "5"))
+NARROW_PX = int(os.environ.get("NARROW_PX", "600"))
+TRADE_DEDUPE = 4000     # Recent trade keys kept, so a re-poll cannot double count
 
 class MobileTerminalEngine:
     def __init__(self):
@@ -112,6 +133,16 @@ class MobileTerminalEngine:
         self.prev_ltp = None
         self.last_update = 0.0          # wall clock of the last book update, any source
         self.ws = None
+
+        # Executed trades, for the footprint and for real candle prices.
+        self.footprint = OrderedDict()  # bar ts -> {levels, ohlc, buy, sell}
+        self.trade_price = None
+        self.last_trade = 0.0           # wall clock of the last trade seen
+        self.trades_seen = 0
+        self.trade_error = ""
+        self._trade_keys = set()
+        self._trade_order = deque(maxlen=TRADE_DEDUPE)
+        self.logged_trade = False       # the first raw payload goes to the log once
 
         self.opens = deque(maxlen=MAX_HISTORY)
         self.highs = deque(maxlen=MAX_HISTORY)
@@ -161,6 +192,36 @@ def flush_bucket():
                  p.cur_close, p.cur_ofi, p.cumulative_ofi)
 
 
+def touch_candle(sec, price):
+    """Fold a price into the current second, rolling the candle over at the
+    boundary. The single owner of the 1s candle, called both by the book and by
+    the trade feed. Caller must hold the lock."""
+    p = mobile_pipeline
+    if p.cur_sec is None:
+        p.cur_sec = sec
+        p.cur_open = p.closes[-1] if p.closes else price
+        p.cur_high = p.cur_low = price
+        p.cur_ofi = 0.0
+    elif sec != p.cur_sec:
+        flush_bucket()
+        p.cur_sec = sec
+        p.cur_open = p.cur_close
+        p.cur_high = p.cur_low = price
+        p.cur_ofi = 0.0
+
+    p.cur_high = max(p.cur_high, price)
+    p.cur_low = min(p.cur_low, price)
+    p.cur_close = price
+
+
+def trades_fresh():
+    """True while the trade feed is delivering. Candle prices come from trades
+    when it is and from the book mid when it is not, so the chart keeps drawing
+    if the trade feed is the component that fails."""
+    last = mobile_pipeline.last_trade
+    return bool(last) and (time.time() - last) < TRADE_FRESH
+
+
 def update_metrics():
     """Recompute OFI from the current top of book. Caller must hold the lock."""
     if not (mobile_pipeline.order_book["bids"] and mobile_pipeline.order_book["asks"]):
@@ -193,24 +254,12 @@ def update_metrics():
     p.cumulative_ofi += step_ofi
 
     # Fold this update into the current second rather than emitting a point per
-    # message: the feed bursts many updates per second.
+    # message: the feed bursts many updates per second. The price is the last
+    # traded one where trades are arriving, and the book mid otherwise.
     sec = pd.Timestamp.now(tz="UTC").floor(BUCKET)
+    price = p.trade_price if (trades_fresh() and p.trade_price) else mid_price
+    touch_candle(sec, price)
 
-    if p.cur_sec is None:
-        p.cur_sec = sec
-        p.cur_open = p.closes[-1] if p.closes else mid_price
-        p.cur_high = p.cur_low = mid_price
-        p.cur_ofi = 0.0
-    elif sec != p.cur_sec:
-        flush_bucket()
-        p.cur_sec = sec
-        p.cur_open = p.cur_close
-        p.cur_high = p.cur_low = mid_price
-        p.cur_ofi = 0.0
-
-    p.cur_high = max(p.cur_high, mid_price)
-    p.cur_low = min(p.cur_low, mid_price)
-    p.cur_close = mid_price
     p.cur_ofi += step_ofi
     p.last_update = time.time()
 
@@ -218,6 +267,141 @@ def update_metrics():
     mobile_pipeline.prev_best_bid_size = best_bid_sz
     mobile_pipeline.prev_best_ask_price = best_ask
     mobile_pipeline.prev_best_ask_size = best_ask_sz
+
+
+def trade_time(raw):
+    """Delta stamps trades in microseconds. Accept seconds and milliseconds too
+    rather than trusting a magnitude that has not been confirmed on this venue."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return pd.Timestamp.now(tz="UTC")
+    if v > 1e17: v = v / 1e9         # nanoseconds
+    elif v > 1e14: v = v / 1e6       # microseconds
+    elif v > 1e11: v = v / 1e3       # milliseconds
+    return pd.Timestamp(v, unit="s", tz="UTC")
+
+
+def parse_trade(t):
+    """One executed trade as (timestamp, price, size, is_buy).
+
+    The exact field names on this venue are not confirmable from here, so every
+    plausible spelling is accepted the same way parse_level accepts both level
+    shapes. is_buy means the aggressor bought: it lifted the ask.
+    """
+    price = float(t.get("price", t.get("p")))
+    size = float(t.get("size", t.get("s", t.get("volume", 0))))
+
+    buyer, seller = t.get("buyer_role"), t.get("seller_role")
+    side = str(t.get("side", "")).lower()
+    if buyer == "taker" or seller == "maker": is_buy = True
+    elif seller == "taker" or buyer == "maker": is_buy = False
+    elif side in ("buy", "b"): is_buy = True
+    elif side in ("sell", "s"): is_buy = False
+    # Delta's l2 convention elsewhere in this file is buy/sell for bid/ask.
+    elif t.get("buyer_role") is None and t.get("is_buyer_maker") is not None:
+        is_buy = not bool(t.get("is_buyer_maker"))
+    else:
+        raise ValueError("no side field")
+
+    ts = trade_time(t.get("timestamp", t.get("created_at", t.get("time"))))
+    if size <= 0:
+        raise ValueError("non-positive size")
+    return ts, price, size, is_buy
+
+
+def record_trade(ts, price, size, is_buy):
+    """Fold one trade into the footprint and into the live candle. Lock held."""
+    p = mobile_pipeline
+    bar = ts.floor(FOOTPRINT_BUCKET)
+    c = p.footprint.get(bar)
+    if c is None:
+        c = {"levels": {}, "open": price, "high": price, "low": price,
+             "close": price, "buy": 0.0, "sell": 0.0}
+        p.footprint[bar] = c
+        # Keep a little more than the widest view asks for, so switching to a
+        # laptop does not show a chart that has to refill.
+        while len(p.footprint) > FOOTPRINT_BARS + 4:
+            p.footprint.popitem(last=False)
+
+    row = round(price // FOOTPRINT_TICK * FOOTPRINT_TICK, 2)
+    level = c["levels"].setdefault(row, [0.0, 0.0])      # [sell, buy]
+    level[1 if is_buy else 0] += size
+    c["buy" if is_buy else "sell"] += size
+    c["high"] = max(c["high"], price)
+    c["low"] = min(c["low"], price)
+    c["close"] = price
+
+    p.trade_price = price
+    p.last_trade = time.time()
+    p.trades_seen += 1
+    touch_candle(ts.floor(BUCKET), price)
+
+
+def ingest_trades(raw_list):
+    """Apply a batch of raw trades, skipping ones already counted.
+
+    A REST poll returns a window that overlaps the previous one, so without the
+    dedupe every poll would inflate the footprint by whatever it re-read.
+    """
+    p = mobile_pipeline
+    fresh = 0
+    for t in raw_list:
+        if not isinstance(t, dict):
+            continue
+        try:
+            ts, price, size, is_buy = parse_trade(t)
+        except (TypeError, ValueError, KeyError):
+            continue
+        key = t.get("id") or t.get("trade_id") or (t.get("timestamp"), price, size, is_buy)
+        if key in p._trade_keys:
+            continue
+        if len(p._trade_order) == p._trade_order.maxlen:
+            p._trade_keys.discard(p._trade_order[0])
+        p._trade_order.append(key)
+        p._trade_keys.add(key)
+        record_trade(ts, price, size, is_buy)
+        fresh += 1
+    return fresh
+
+
+def log_first_trade(payload):
+    """Print one raw payload so the real field names can be read off the Render
+    logs. The venue's trade schema could not be confirmed from the sandbox."""
+    if mobile_pipeline.logged_trade:
+        return
+    mobile_pipeline.logged_trade = True
+    print(f"[TRADES] first raw payload: {json.dumps(payload)[:600]}", flush=True)
+
+
+def poll_trades():
+    """Poll executed trades. The book poller cannot serve this: it returns
+    resting orders, and a footprint needs fills."""
+    url = TRADES_URL.format(symbol=SYMBOL)
+    headers = {"Accept": "application/json", "User-Agent": "orderflow-dashboard/1.0"}
+    delay = TRADES_INTERVAL
+    while True:
+        try:
+            time.sleep(delay)
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode())
+
+            result = payload.get("result")
+            if isinstance(result, dict):
+                result = result.get("trades") or result.get("result") or []
+            log_first_trade(result[:2] if isinstance(result, list) else payload)
+
+            with mobile_pipeline.lock:
+                fresh = ingest_trades(result or [])
+            if fresh:
+                mobile_pipeline.trade_error = ""
+            delay = TRADES_INTERVAL
+        except Exception as exc:
+            delay = min(delay * 2, REST_MAX_BACKOFF)
+            mobile_pipeline.trade_error = f"{type(exc).__name__}: {exc}"[:70]
+            print(f"[TRADES ERROR] retry in {delay:.1f}s: {type(exc).__name__}: {exc}",
+                  flush=True)
 
 
 def on_message(ws, message):
@@ -235,6 +419,17 @@ def on_message(ws, message):
             update_metrics()
             mobile_pipeline.last_ws_data = time.time()
 
+    elif msg_type in ("all_trades", "trades", "recent_trade"):
+        # Lower latency than the poller where the venue accepts the channel. The
+        # channel name is not confirmable from the sandbox, so both spellings are
+        # subscribed and whichever arrives is handled.
+        batch = data.get("trades")
+        if not isinstance(batch, list):
+            batch = [data]
+        log_first_trade(batch[:2])
+        with mobile_pipeline.lock:
+            ingest_trades(batch)
+
     elif msg_type == "l2_orderbook":
         # Full depth snapshot; Delta names the sides buy/sell on this channel.
         with mobile_pipeline.lock:
@@ -249,7 +444,7 @@ def on_message(ws, message):
 
 def on_open(ws):
     # Separate frames, so a rejected channel name does not fail the other.
-    for name in ("l2_updates", "l2_orderbook"):
+    for name in ("l2_updates", "l2_orderbook", "all_trades", "trades"):
         payload = {"type": "subscribe", "payload": {"channels": [{"name": name, "symbols": [SYMBOL]}]}}
         ws.send(json.dumps(payload))
         print(f"[WS] sent subscribe for {name}:{SYMBOL}", flush=True)
@@ -382,7 +577,7 @@ def keepalive():
 
 
 WORKERS = (("ws", ws_forever), ("watchdog", watchdog), ("rest", poll_rest),
-           ("keepalive", keepalive))
+           ("trades", poll_trades), ("keepalive", keepalive))
 _threads = {}
 _retired = set()        # workers that finished on purpose and must not be respawned
 _threads_lock = threading.Lock()
@@ -523,6 +718,78 @@ def dom_table(bids, asks):
         ])
 
 
+def footprint_figure(bars, trade_error):
+    """Per-bar, per-price-row sell x buy volume, candles drawn over the top.
+
+    A Heatmap carries the numbers because it is one trace for the whole grid
+    rather than one per cell, and its texttemplate puts the pair inside each
+    box. Its x axis is categorical, so go.Candlestick cannot share it and the
+    bodies and wicks are line segments instead. This is the arrangement the
+    public OrderflowChart project settled on, and the reason is the same.
+    """
+    if not bars:
+        why = f"trades: {trade_error}" if trade_error else "waiting for the first trades"
+        return waiting_figure(why, "", ""), "FOOTPRINT · no trades yet"
+
+    keys = sorted(bars)
+    labels = [k.tz_convert(DISPLAY_TZ).strftime("%H:%M") for k in keys]
+    rows = sorted({r for k in keys for r in bars[k]["levels"]})
+
+    xs, ys, zs, texts = [], [], [], []
+    for label, k in zip(labels, keys):
+        levels = bars[k]["levels"]
+        for row in rows:
+            sell, buy = levels.get(row, (0.0, 0.0))
+            xs.append(label)
+            ys.append(row)
+            if not (sell or buy):
+                zs.append(None)
+                texts.append("")
+                continue
+            # Imbalance colours the cell: +1 all buying, -1 all selling.
+            zs.append((buy - sell) / (buy + sell))
+            texts.append(f"{sell:,.0f} x {buy:,.0f}")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.02, row_heights=[0.82, 0.18])
+    fig.add_trace(go.Heatmap(
+        x=xs, y=ys, z=zs, text=texts, texttemplate="%{text}",
+        textfont={"size": 9, "family": "ui-monospace, monospace"},
+        colorscale=[[0.0, "#5c1a20"], [0.5, "#1c2230"], [1.0, "#0d4a3e"]],
+        zmid=0, showscale=False, xgap=2, ygap=1, hoverinfo="skip",
+    ), row=1, col=1)
+
+    for label, k in zip(labels, keys):
+        c = bars[k]
+        colour = "#089981" if c["close"] >= c["open"] else "#f23645"
+        fig.add_trace(go.Scatter(x=[label, label], y=[c["low"], c["high"]], mode="lines",
+                                 line=dict(color=colour, width=1),
+                                 hoverinfo="skip", showlegend=False), row=1, col=1)
+        fig.add_trace(go.Scatter(x=[label, label], y=[c["open"], c["close"]], mode="lines",
+                                 line=dict(color=colour, width=5),
+                                 hoverinfo="skip", showlegend=False), row=1, col=1)
+
+    deltas = [bars[k]["buy"] - bars[k]["sell"] for k in keys]
+    fig.add_trace(go.Bar(x=labels, y=deltas, hoverinfo="skip", showlegend=False,
+                         marker_color=["#089981" if d >= 0 else "#f23645" for d in deltas]),
+                  row=2, col=1)
+
+    # b=22, not the main chart's 5: the bar times sit on this axis and 5px
+    # clips them against whatever is drawn underneath.
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#131722",
+                      plot_bgcolor="#131722", height=540,
+                      margin=dict(l=8, r=40, t=5, b=22), showlegend=False,
+                      uirevision="footprint")
+    fig.update_yaxes(side="right", tickfont=dict(size=9), gridcolor="#2a2e39", row=1, col=1)
+    fig.update_yaxes(side="right", tickfont=dict(size=8), gridcolor="#2a2e39", row=2, col=1)
+    fig.update_xaxes(tickfont=dict(size=9), gridcolor="#2a2e39", row=2, col=1)
+
+    total = sum(bars[k]["buy"] + bars[k]["sell"] for k in keys)
+    head = (f"FOOTPRINT · {FOOTPRINT_BUCKET} · ${FOOTPRINT_TICK:,.0f} rows · "
+            f"sell x buy · Δ {deltas[-1]:+,.0f} · vol {total:,.0f}")
+    return fig, head
+
+
 def callbacks_arriving():
     """True when the in-place update callback has run recently enough to drive
     the page on its own."""
@@ -585,10 +852,18 @@ def api_frame():
     mobile_pipeline.callbacks += 1
     mobile_pipeline.last_callback = time.time()
 
-    ticker, ticker_style, fig, ltp, ltp_style, delta, table = _safe_render(0)
+    width = 0
+    try:
+        width = int(request.args.get("w", 0))
+    except (TypeError, ValueError):
+        width = 0
+    (ticker, ticker_style, fig, ltp, ltp_style, delta, table,
+     fp_fig, fp_head) = _safe_render(0, width)
     # The template is ~8KB, static, and already established by the first render.
     fig_json = fig.to_plotly_json()
     fig_json.get("layout", {}).pop("template", None)
+    fp_json = fp_fig.to_plotly_json()
+    fp_json.get("layout", {}).pop("template", None)
 
     payload = {
         "clock": frame_clock(),
@@ -599,6 +874,8 @@ def api_frame():
         "ltp_style": ltp_style,
         "ltp_delta": delta,
         "table": table,
+        "footprint": fp_json,
+        "footprint_head": fp_head,
     }
     # PlotlyJSONEncoder recurses into nested components, which is what the table
     # needs. to_plotly_json() converts only the outermost one.
@@ -633,6 +910,12 @@ def health():
         "seconds_since_update": age,
         "websocket": ws_state,
         "rest_error": rest_error or None,
+        "trades": {"seen": mobile_pipeline.trades_seen,
+                   "bars": len(mobile_pipeline.footprint),
+                   "fresh": trades_fresh(),
+                   "seconds_since_trade": (round(time.time() - mobile_pipeline.last_trade, 1)
+                                           if mobile_pipeline.last_trade else None),
+                   "error": mobile_pipeline.trade_error or None},
         "pid": os.getpid(),
         "threads": sorted(n for n, t in _threads.items() if t.is_alive()),
         "callbacks": mobile_pipeline.callbacks,
@@ -669,7 +952,8 @@ def serve_layout():
     seeded at process start. It also keeps the page useful where the update
     callback is not reaching the browser.
     """
-    ticker, ticker_style, fig, ltp, ltp_style, delta, table = _safe_render(0)
+    (ticker, ticker_style, fig, ltp, ltp_style, delta, table,
+     fp_fig, fp_head) = _safe_render(0)
 
     return html.Div(
     style={"backgroundColor": "#131722", "color": "#d1d4dc", "fontFamily": "sans-serif", "padding": "5px"},
@@ -700,6 +984,12 @@ def serve_layout():
         ),
         dcc.Graph(id="mobile-master-chart", figure=fig,
                   config={"displayModeBar": False, "scrollZoom": True}),
+        html.Div(id="footprint-head", children=fp_head,
+                 style={"padding": "10px 8px 2px", "fontSize": "11px",
+                        "color": "#787b86", "fontFamily": "ui-monospace, monospace",
+                        "borderTop": "1px solid #2a2e39"}),
+        dcc.Graph(id="footprint-chart", figure=fp_fig,
+                  config={"displayModeBar": False, "scrollZoom": True}),
         html.Div(id="dom-table", children=table, style={"padding": "4px 8px 12px"}),
         dcc.Interval(id="mobile-pulse-clock", interval=REFRESH_RATE_MS, n_intervals=0)
     ]
@@ -714,7 +1004,7 @@ def serve_layout():
 app.clientside_callback(
     """
     function(n) {
-        var blank = Array(8).fill(window.dash_clientside.no_update);
+        var blank = Array(10).fill(window.dash_clientside.no_update);
 
         // One request in flight at a time. The interval fires whether or not
         // the last frame arrived, so on a slow link requests otherwise pile up
@@ -726,14 +1016,17 @@ app.clientside_callback(
         var ctl = new AbortController();
         var timer = setTimeout(function () { ctl.abort(); }, %(timeout)d);
 
-        return fetch('/api/frame', {cache: 'no-store', signal: ctl.signal})
+        // The width picks the footprint bar count: twelve bars overlap at 400px.
+        var url = '/api/frame?w=' + Math.round(window.innerWidth || 0);
+        return fetch(url, {cache: 'no-store', signal: ctl.signal})
             .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
             .then(function (d) {
                 clearTimeout(timer);
                 window._ofBusy = false;
                 window._ofStall = 0;
                 return [d.ticker, d.ticker_style, d.figure,
-                        d.ltp, d.ltp_style, d.ltp_delta, d.table, d.clock];
+                        d.ltp, d.ltp_style, d.ltp_delta, d.table, d.clock,
+                        d.footprint, d.footprint_head];
             })
             .catch(function () {
                 clearTimeout(timer);
@@ -753,14 +1046,16 @@ app.clientside_callback(
      Output("ltp-value", "style"),
      Output("ltp-delta", "children"),
      Output("dom-table", "children"),
-     Output("frame-clock", "children")],
+     Output("frame-clock", "children"),
+     Output("footprint-chart", "figure"),
+     Output("footprint-head", "children")],
     [Input("mobile-pulse-clock", "n_intervals")],
 )
 
 
-def _safe_render(n):
+def _safe_render(n, width=0):
     try:
-        return _render(n)
+        return _render(n, width)
     except Exception as exc:
         # Raising sends no update at all and the page sits on its last draw with
         # nothing to say why. Show the fault instead.
@@ -769,10 +1064,11 @@ def _safe_render(n):
         msg = f"RENDER ERROR · {type(exc).__name__}: {exc}"[:140]
         return (msg, {"color": "#f23645", "fontSize": "11px"},
                 waiting_figure(msg, "", ""), "—",
-                {"fontSize": "28px", "fontWeight": "bold", "color": "#787b86"}, "", None)
+                {"fontSize": "28px", "fontWeight": "bold", "color": "#787b86"}, "", None,
+                waiting_figure(msg, "", ""), "FOOTPRINT · unavailable")
 
 
-def _render(n):
+def _render(n, width=0):
     ensure_workers()        # a forked worker starts its own feed on first request
 
     with mobile_pipeline.lock:
@@ -799,6 +1095,14 @@ def _render(n):
         rest_error = mobile_pipeline.rest_error
         ltp_error = mobile_pipeline.ltp_error
         ltp, prev_ltp = mobile_pipeline.ltp, mobile_pipeline.prev_ltp
+        trade_error = mobile_pipeline.trade_error
+        # A narrow viewport gets fewer bars: twelve of them overlap at 400px.
+        want = FOOTPRINT_BARS_NARROW if 0 < width < NARROW_PX else FOOTPRINT_BARS
+        fp_keys = sorted(mobile_pipeline.footprint)[-want:]
+        bars = {k: {"levels": dict(mobile_pipeline.footprint[k]["levels"]),
+                    **{f: mobile_pipeline.footprint[k][f]
+                       for f in ("open", "high", "low", "close", "buy", "sell")}}
+                for k in fp_keys}
 
     # Converted before anything is plotted: the series is kept in UTC and only
     # the axis reads in local time.
@@ -806,11 +1110,12 @@ def _render(n):
 
     ltp_text, ltp_style, ltp_delta = format_ltp(ltp, prev_ltp)
     table = dom_table(bids, asks)
+    fp_fig, fp_head = footprint_figure(bars, trade_error)
 
     if not times:
         return (f"WAITING · {ws_state}", {"color": "#db8c02"},
                 waiting_figure(ws_state, rest_error, ltp_error),
-                ltp_text, ltp_style, ltp_delta, table)
+                ltp_text, ltp_style, ltp_delta, table, fp_fig, fp_head)
 
     last_price = cl[-1]
     ticker_color = "#089981" if ofi_steps_list[-1] >= 0 else "#f23645"
@@ -893,7 +1198,7 @@ def _render(n):
     )
 
     return (ticker_text, {"color": ticker_color}, fig,
-            ltp_text, ltp_style, ltp_delta, table)
+            ltp_text, ltp_style, ltp_delta, table, fp_fig, fp_head)
 
 # Assigned after the callback, not beside serve_layout: Dash evaluates the
 # callable immediately and it renders through _safe_render above.
