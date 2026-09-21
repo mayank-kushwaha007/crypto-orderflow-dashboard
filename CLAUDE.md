@@ -26,6 +26,9 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
 - `FOOTPRINT_BUCKET` / `FOOTPRINT_TICK` — footprint bar period and price row height,
   default `5min` and `50`. `FOOTPRINT_BARS` (12) and `FOOTPRINT_BARS_NARROW` (5) are the
   bar counts above and below `NARROW_PX` (600) of viewport width.
+- `FOOTPRINT_HEIGHT` (620) / `OFI_STRIP_HEIGHT` (190) — the footprint is the chart being
+  read, so it is first and tall; the OFI panel sits under it as a strip. The footprint
+  already draws the candles, so the strip is there for the OFI bar and whether it agrees.
 - `DISPLAY_TZ` — timezone for chart axis labels, default `Asia/Kolkata`. Display only.
 - `RENDER_EXTERNAL_URL` — set by Render; the keepalive requests it every 10 minutes.
   Only inbound traffic resets Render's idle timer, so calls to the exchange do not
@@ -112,8 +115,13 @@ otherwise, so the chart keeps drawing when the trade feed is the component that 
 `touch_candle()` is the single owner of the 1s candle; OFI is computed from the book in
 `update_metrics()` and is unaffected by any of this.
 
+`footprint_figure`'s docstring carries the note on what to infer from the chart —
+absorption, imbalance, point of control, delta divergence, exhaustion. Keep it there;
+it is the part a reader of this code most needs and least gets from the code itself.
+
 The footprint is a `go.Heatmap` — one trace for the whole grid, with `texttemplate`
-putting `sell x buy` inside each cell. Its x axis is categorical, so `go.Candlestick`
+putting `sell x buy` inside each cell, shortened by `fp_num` to `1.5k` above a thousand
+because a column is ~70px at phone width and a full-width pair runs over the price axis. Its x axis is categorical, so `go.Candlestick`
 cannot share it and the bodies and wicks are `go.Scatter` segments. This is the
 arrangement the public OrderflowChart project uses, for the same reason. Its bottom
 margin is 22px, not the main chart's 5, or the bar times clip.
