@@ -101,6 +101,10 @@ TICK_HYSTERESIS = float(os.environ.get("TICK_HYSTERESIS", "1.5"))
 # rather than leaving old bars on the old grid. This caps the distinct prices
 # one bar will hold, since that is what the store costs.
 FOOTPRINT_MAX_LEVELS = int(os.environ.get("FOOTPRINT_MAX_LEVELS", "5000"))
+# Thresholds for the per-bar read. These are judgement calls, not measured
+# edges: retune them against your own instrument before trusting a flag.
+FP_IMBALANCE = float(os.environ.get("FP_IMBALANCE", "0.35"))    # |delta|/volume to call a side
+FP_ABSORB_POS = float(os.environ.get("FP_ABSORB_POS", "0.35"))  # close this near the wrong end
 try:
     FIXED_TICK = float(FOOTPRINT_TICK)
     if FIXED_TICK <= 0: FIXED_TICK = 0.0
@@ -689,7 +693,8 @@ def waiting_figure(ws_state, rest_error, ltp_error, height=FOOTPRINT_HEIGHT):
                        x=0.5, y=0.5, align="left",
                        font=dict(size=12, color="#787b86", family="ui-monospace, monospace"))
     fig.update_layout(template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
-                      height=height, margin=dict(l=8, r=40, t=5, b=5), showlegend=False)
+                      height=height, margin=dict(l=8, r=40, t=5, b=5), showlegend=False,
+                      dragmode=False)
     fig.update_xaxes(visible=False, fixedrange=True)
     fig.update_yaxes(visible=False, fixedrange=True)
     return fig
@@ -804,6 +809,55 @@ def bucket_levels(levels, tick):
     return grid
 
 
+def read_bar(bar, prev):
+    """A short read of one footprint bar: (label, flagged, why).
+
+    The labels describe what the bar did. A flag marks the two cases worth
+    stopping on, and it is a prompt to look, NOT a signal to trade - these are
+    conventional readings with thresholds picked by hand, never backtested
+    here, and a bar means little without the level it is trading against.
+
+    ABS  absorption. One side was clearly the aggressor and price closed at the
+         opposite end anyway, so that aggression was filled by someone. The
+         arrow points where the absorbing side would have price go.
+    DIV  divergence. A higher high on weaker buying than the bar before, or a
+         lower low on weaker selling: the extension is not backed by flow.
+    BUY  buyers were the aggressors and price agreed. SELL the mirror.
+    BAL  neither side dominant.
+    """
+    vol = bar["buy"] + bar["sell"]
+    if vol <= 0:
+        return "—", False, ""
+    skew = (bar["buy"] - bar["sell"]) / vol
+    rng = bar["high"] - bar["low"]
+    pos = (bar["close"] - bar["low"]) / rng if rng > 0 else 0.5
+
+    if skew >= FP_IMBALANCE and pos <= FP_ABSORB_POS:
+        return "ABS↓", True, "buying absorbed at the highs"
+    if skew <= -FP_IMBALANCE and pos >= 1 - FP_ABSORB_POS:
+        return "ABS↑", True, "selling absorbed at the lows"
+
+    if prev is not None:
+        d, pd_ = bar["buy"] - bar["sell"], prev["buy"] - prev["sell"]
+        if bar["high"] > prev["high"] and d < pd_ and d > 0 and pd_ > 0:
+            return "DIV↓", True, "higher high on weaker buying"
+        if bar["low"] < prev["low"] and d > pd_ and d < 0 and pd_ < 0:
+            return "DIV↑", True, "lower low on weaker selling"
+
+    if skew >= FP_IMBALANCE: return "BUY", False, ""
+    if skew <= -FP_IMBALANCE: return "SELL", False, ""
+    return "BAL", False, ""
+
+
+def read_bars(keys, bars):
+    """read_bar over the visible bars, each against the one before it."""
+    out, prev = [], None
+    for k in keys:
+        out.append(read_bar(bars[k], prev))
+        prev = bars[k]
+    return out
+
+
 def fp_num(v):
     """Cell volumes, short. A column is about 70px at phone width, so a pair
     like "1,040 x 1,521" runs past the cell and over the price axis; "1.0k x
@@ -895,12 +949,30 @@ def footprint_figure(bars, trade_error, tick):
                          marker_color=["#089981" if d >= 0 else "#f23645" for d in deltas]),
                   row=2, col=1)
 
+    # The read of each bar goes under its time, and a flagged one gets a mark
+    # above its high. Both are drawn from read_bars, so the label and the flag
+    # can never disagree about what the bar did.
+    reads = read_bars(keys, bars)
+    ticktext = []
+    for label, (name, flagged, _why) in zip(labels, reads):
+        ticktext.append(f"{label}<br>{'⚑ ' if flagged else ''}{name}")
+    for label, k, (name, flagged, why) in zip(labels, keys, reads):
+        if not flagged: continue
+        up = name.endswith("↑")
+        fig.add_annotation(x=label, y=bars[k]["high"], text="⚑", showarrow=False,
+                           yshift=12, font=dict(size=13,
+                           color="#089981" if up else "#f23645"),
+                           hovertext=why, row=1, col=1)
+
     # b=22, not the main chart's 5: the bar times sit on this axis and 5px
     # clips them against whatever is drawn underneath.
+    # dragmode=False as well as fixedrange: fixedrange takes zoom and pan off
+    # the axes but Plotly still installs its touch drag layer, which swallows a
+    # swipe, so the page could not be scrolled past the chart on a phone.
     fig.update_layout(template="plotly_dark", paper_bgcolor="#131722",
                       plot_bgcolor="#131722", height=FOOTPRINT_HEIGHT,
-                      margin=dict(l=8, r=40, t=5, b=22), showlegend=False,
-                      uirevision="footprint")
+                      margin=dict(l=8, r=40, t=5, b=34), showlegend=False,
+                      dragmode=False, uirevision="footprint")
     # Dragging a chart on a phone otherwise pans it instead of scrolling the
     # page, which makes the page hard to move around. fixedrange takes zoom and
     # pan off both axes, so the touch reaches the page.
@@ -909,12 +981,15 @@ def footprint_figure(bars, trade_error, tick):
     fig.update_yaxes(side="right", tickfont=dict(size=8), gridcolor="#2a2e39",
                      fixedrange=True, row=2, col=1)
     fig.update_xaxes(fixedrange=True, row=1, col=1)
-    fig.update_xaxes(tickfont=dict(size=9), gridcolor="#2a2e39",
-                     fixedrange=True, row=2, col=1)
+    fig.update_xaxes(tickfont=dict(size=9), gridcolor="#2a2e39", fixedrange=True,
+                     tickmode="array", tickvals=labels, ticktext=ticktext,
+                     row=2, col=1)
 
     total = sum(bars[k]["buy"] + bars[k]["sell"] for k in keys)
+    name, flagged, why = reads[-1]
+    now = f"⚑ {name} · {why}" if flagged else name
     head = (f"FOOTPRINT · {FOOTPRINT_BUCKET} · ${fmt_tick(tick)} rows · "
-            f"sell x buy · Δ {deltas[-1]:+,.0f} · vol {total:,.0f}")
+            f"sell x buy · Δ {deltas[-1]:+,.0f} · vol {total:,.0f} · {now}")
     return fig, head
 
 
@@ -925,21 +1000,63 @@ def callbacks_arriving():
     return bool(last) and (time.time() - last) < CALLBACK_FRESH
 
 
-class LiveDash(dash.Dash):
-    """Emits the reload meta tag only while the update callback is not arriving.
+# A reload puts the reader back at the top of the page, which on a phone means
+# losing the chart they had scrolled to. Both reloads here are involuntary - the
+# refresh tag and the stall recovery - so the position is carried across.
+# Re-applied as the graphs render, since the page is not full height until then.
+SCROLL_KEEP = """
+<script>
+(function () {
+  var KEY = 'of-scroll';
+  function save() { try { sessionStorage.setItem(KEY, String(window.scrollY)); } catch (e) {} }
+  function restore() {
+    try {
+      var y = parseInt(sessionStorage.getItem(KEY) || '0', 10);
+      if (!y) { return; }
+      var tries = 0;
+      var t = setInterval(function () {
+        if (window.scrollY < y) { window.scrollTo(0, y); }
+        if (++tries > 20) { clearInterval(t); }
+      }, 100);
+    } catch (e) {}
+  }
+  window.addEventListener('scroll', save, {passive: true});
+  if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', restore);
+  } else { restore(); }
+})();
+</script>
+"""
 
-    Where the callback works the tag is absent and the page updates in place, as
-    Dash intends. The decision is made per page load, so it corrects itself in
-    both directions.
+
+def reload_timer():
+    """The fallback reload, as a timer the page can cancel.
+
+    This was a <meta http-equiv="refresh"> tag. Once the browser has parsed one
+    it is armed and cannot be called off - removing the element does nothing -
+    so a page that turned out to be updating perfectly well still reloaded, and
+    every reload threw the reader back to the top. A timer does the same job
+    and the first frame that lands clears it.
+    """
+    return (f'<script>window._ofReload = setTimeout(function () '
+            f'{{ location.reload(); }}, {AUTO_REFRESH_SECONDS * 1000});</script>')
+
+
+class LiveDash(dash.Dash):
+    """Arms the fallback reload only while the update callback is not arriving.
+
+    Where the callback works the timer is absent, or is cleared by the first
+    frame, and the page updates in place as Dash intends. The server only sees
+    its own worker's callback counter, so the browser clearing the timer is the
+    authority: under more than one gunicorn worker the worker rendering the page
+    may never have served a frame.
     """
 
     def interpolate_index(self, **kwargs):
         doc = super().interpolate_index(**kwargs)
         if AUTO_REFRESH_SECONDS > 0 and not callbacks_arriving():
-            doc = doc.replace(
-                "<head>",
-                f'<head><meta http-equiv="refresh" content="{AUTO_REFRESH_SECONDS}">', 1)
-        return doc
+            doc = doc.replace("<head>", "<head>" + reload_timer(), 1)
+        return doc.replace("<head>", "<head>" + SCROLL_KEEP, 1)
 
 
 app = LiveDash(__name__, title="TradingView Mobile Terminal")
@@ -1115,13 +1232,19 @@ def serve_layout():
         html.Div(id="footprint-head", children=fp_head,
                  style={"padding": "6px 8px 2px", "fontSize": "11px",
                         "color": "#787b86", "fontFamily": "ui-monospace, monospace"}),
+        # The height is pinned in CSS as well as in the figure. Replacing a
+        # figure re-renders the graph, and for that moment the container has no
+        # height: the document collapses, the browser clamps scrollY to 0, and
+        # every frame threw the reader back to the top of the page.
         dcc.Graph(id="footprint-chart", figure=fp_fig,
+                  style={"height": f"{FOOTPRINT_HEIGHT}px"},
                   config={"displayModeBar": False, "scrollZoom": False}),
         html.Div("OFI · 1s steps · price", style={"padding": "8px 8px 2px",
                  "fontSize": "10px", "color": "#787b86",
                  "fontFamily": "ui-monospace, monospace",
                  "borderTop": "1px solid #2a2e39"}),
         dcc.Graph(id="mobile-master-chart", figure=fig,
+                  style={"height": f"{OFI_STRIP_HEIGHT}px"},
                   config={"displayModeBar": False, "scrollZoom": False}),
         html.Div(id="dom-table", children=table, style={"padding": "4px 8px 12px"}),
         dcc.Interval(id="mobile-pulse-clock", interval=REFRESH_RATE_MS, n_intervals=0)
@@ -1157,6 +1280,17 @@ app.clientside_callback(
                 clearTimeout(timer);
                 window._ofBusy = false;
                 window._ofStall = 0;
+                // A frame landed, so in-place updates work and the reload tag
+                // is wrong. The server only infers this from its own callback
+                // counter, which is per worker: under more than one gunicorn
+                // worker the one rendering the page may never have served a
+                // frame, so it emitted the tag forever and the page reloaded
+                // every AUTO_REFRESH_SECONDS, throwing away the scroll
+                // position each time. The browser knows for certain.
+                if (window._ofReload) {
+                    clearTimeout(window._ofReload);
+                    window._ofReload = null;
+                }
                 return [d.ticker, d.ticker_style, d.figure,
                         d.ltp, d.ltp_style, d.ltp_delta, d.table, d.clock,
                         d.footprint, d.footprint_head];
@@ -1319,6 +1453,7 @@ def _render(n, width=0):
         height=OFI_STRIP_HEIGHT,
         margin=dict(l=8, r=40, t=5, b=18),
         showlegend=False,
+        dragmode=False,
         uirevision='constant'
     )
 

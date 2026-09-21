@@ -13,10 +13,12 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
 - `DATABASE_URL` — Postgres connection string. **Unset is a supported mode**: storage
   goes inert and the app behaves exactly as it did before. Never make persistence
   load-bearing for the live chart.
-- `AUTO_REFRESH_SECONDS` — fallback reload interval, default 5, `0` disables. The tag
-  is emitted **only while the update callback is not arriving**, so where Dash works
-  normally — a laptop, a local run — it is absent and the page updates in place. The
-  decision is per page load and corrects itself in both directions.
+- `AUTO_REFRESH_SECONDS` — fallback reload interval, default 5, `0` disables. Armed
+  **only while the update callback is not arriving**, and cleared by the first frame
+  that lands. It is a `setTimeout`, **not a `<meta http-equiv="refresh">`**: once a
+  browser has parsed a meta refresh it is armed and cannot be called off — removing the
+  element does nothing — so a page that turned out to be updating fine still reloaded
+  every 5s and threw the reader back to the top. Do not put the tag back.
 - `REFRESH_RATE_MS` — browser update interval, default 5000. A gzipped frame is ~1.6KB,
   so this needs about 0.32KB/s, roughly 1.2MB/hour; 1000 is five times both. Two values
   derive from it and must keep their relationship: `FETCH_TIMEOUT_MS` is four intervals
@@ -31,6 +33,8 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
   number here overrides it and is used exactly as given. `FOOTPRINT_ROWS_TARGET` (14) is
   what auto aims for, `TICK_HYSTERESIS` (1.5) how far the ideal must drift before the
   grid re-snaps, `FOOTPRINT_MAX_LEVELS` (5000) the distinct prices one bar will hold.
+- `FP_IMBALANCE` (0.35) / `FP_ABSORB_POS` (0.35) — thresholds for the per-bar read in
+  `read_bar`. Judgement calls, never backtested here; retune per instrument.
 - `FOOTPRINT_HEIGHT` (620) / `OFI_STRIP_HEIGHT` (190) — the footprint is the chart being
   read, so it is first and tall; the OFI panel sits under it as a strip. The footprint
   already draws the candles, so the strip is there for the OFI bar and whether it agrees.
@@ -137,9 +141,22 @@ rung apart, so any drift over a rung boundary clears any ratio. The held tick is
 per bar count, since a phone and a laptop see different spans and must not fight over
 one value.
 
-Both charts have `fixedrange=True` on every axis and `scrollZoom: False`. On a phone a
-drag otherwise pans the chart instead of scrolling the page, which makes the page hard
-to move around.
+Both charts have `fixedrange=True` on every axis, `scrollZoom: False` **and
+`dragmode=False`**. `fixedrange` alone was not enough: Plotly still installs its touch
+drag layer, which swallowed the swipe, so the page could not be scrolled past a chart
+on a phone.
+
+Scroll position is saved to `sessionStorage` and restored by `SCROLL_KEEP`, re-applied
+as the graphs render because the page is not full height until then. Both reloads here
+are involuntary — the fallback timer and the stall recovery — and losing the reader's
+place on a phone costs more than the reload buys.
+
+`read_bar` gives each bar a short label under its time on the axis, and flags the two
+cases worth stopping on with a mark above the bar: absorption (one side clearly the
+aggressor, price closed at the opposite end) and divergence (a higher high on weaker
+buying, or a lower low on weaker selling). Absorption outranks divergence on the same
+bar. **These are prompts to look, not signals**: conventional readings with hand-picked
+thresholds, never backtested in this repo.
 
 The footprint is a `go.Heatmap` — one trace for the whole grid, with `texttemplate`
 putting `sell x buy` inside each cell, shortened by `fp_num` to `1.5k` above a thousand
