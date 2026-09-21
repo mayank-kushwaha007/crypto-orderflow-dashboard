@@ -23,6 +23,9 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
   capped at 10s, and `CALLBACK_FRESH` is two intervals — shorter than one interval and
   `callbacks_arriving()` flaps between ticks, re-arming the reload tag on a page that is
   updating perfectly well.
+- `FOOTPRINT_BUCKET` / `FOOTPRINT_TICK` — footprint bar period and price row height,
+  default `5min` and `50`. `FOOTPRINT_BARS` (12) and `FOOTPRINT_BARS_NARROW` (5) are the
+  bar counts above and below `NARROW_PX` (600) of viewport width.
 - `DISPLAY_TZ` — timezone for chart axis labels, default `Asia/Kolkata`. Display only.
 - `RENDER_EXTERNAL_URL` — set by Render; the keepalive requests it every 10 minutes.
   Only inbound traffic resets Render's idle timer, so calls to the exchange do not
@@ -85,6 +88,36 @@ confirmed from the Render logs instead — do not guess at socket URLs.
 - Never commit `__pycache__/` or `.pyc` files.
 - Keep each change minimal and scoped to what was agreed.
 
+## The footprint needs trades, not the book
+
+The `l2_*` channels carry **resting orders**. A footprint is per-price-row executed
+volume split by which side the aggressor was on, so it is built from a separate feed:
+`GET /v2/trades/{symbol}`, public and unauthenticated (it is `get_public_trades()` in
+Delta's own REST client), polled by the `trades` worker. The websocket `all_trades` /
+`trades` channels are subscribed as well and handled if they arrive.
+
+**The trade schema is not confirmed.** `docs.delta.exchange` is egress-blocked from
+Claude Code sandboxes, so `parse_trade` accepts every plausible spelling — `buyer_role`,
+`seller_role`, `side`, `is_buyer_maker` — and `trade_time` accepts seconds through
+nanoseconds. The first raw payload is printed once as `[TRADES] first raw payload:`.
+**Read it in the Render logs and narrow the parser to what the venue actually sends**
+rather than leaving it guessing forever.
+
+A REST poll returns a window overlapping the previous one, so `ingest_trades` dedupes on
+the trade id, or on `(timestamp, price, size, side)` where there is none. Without it
+every poll would inflate the footprint by whatever it re-read.
+
+Candle prices come from trades while `trades_fresh()` holds and from the book mid
+otherwise, so the chart keeps drawing when the trade feed is the component that fails.
+`touch_candle()` is the single owner of the 1s candle; OFI is computed from the book in
+`update_metrics()` and is unaffected by any of this.
+
+The footprint is a `go.Heatmap` — one trace for the whole grid, with `texttemplate`
+putting `sell x buy` inside each cell. Its x axis is categorical, so `go.Candlestick`
+cannot share it and the bodies and wicks are `go.Scatter` segments. This is the
+arrangement the public OrderflowChart project uses, for the same reason. Its bottom
+margin is 22px, not the main chart's 5, or the bar times clip.
+
 ## OFI semantics
 
 Cumulative OFI is a **UTC daily session total**, not a since-startup figure. It
@@ -146,8 +179,10 @@ way: storing local time makes stored data ambiguous across DST and deployments.
 
 ## Where a frame's time goes
 
-Measured, median of 50: ingest and OFI aggregation 0.46ms (0.9%), building the Plotly
-figure 44.6ms (92.4%), JSON 3.0ms, gzip 0.2ms. The aggregation is scalar arithmetic on
+Measured, median of 50, before the footprint: ingest and OFI aggregation 0.46ms (0.9%),
+building the Plotly figure 44.6ms (92.4%), JSON 3.0ms, gzip 0.2ms. The footprint adds
+30-60ms to the build and takes the gzipped frame from 1.6KB to 2.5KB at 5 bars and
+3.1KB at 12 — about a second on a 3KB/s link, against a 5s cadence. The aggregation is scalar arithmetic on
 a handful of floats — numba or similar would optimise under 1% of the work. If frame
 build ever needs to be faster, the target is Plotly object construction: consolidating
 the sixteen per-level DOM scatter traces into two measured 24.5ms to 19.4ms.
@@ -159,5 +194,5 @@ gap of seconds; look at transport and at reload cost instead.
 
 - One data point is appended per websocket message, not per second, so the `1S` label
   and the 40-point window are message-based rather than time-based.
-- Candles are synthesised from consecutive mid prices, so they are degenerate by
-  construction.
+- The footprint starts empty after a restart and takes `FOOTPRINT_BUCKET` × bars of
+  trading to fill. It is not persisted; only candles are.
