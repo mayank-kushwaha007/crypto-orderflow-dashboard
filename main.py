@@ -1,5 +1,6 @@
 import gzip
 import json
+import math
 import os
 import urllib.request
 import threading
@@ -84,9 +85,27 @@ DISPLAY_TZ = os.environ.get("DISPLAY_TZ", "Asia/Kolkata")
 STALE_AFTER = 5         # Seconds without a book update before the ticker says so
 
 # Footprint. Each bar is one FOOTPRINT_BUCKET of trades, split into rows
-# FOOTPRINT_TICK wide, showing sell volume x buy volume at that price.
+# showing sell volume x buy volume at that price.
 FOOTPRINT_BUCKET = os.environ.get("FOOTPRINT_BUCKET", "5min")
-FOOTPRINT_TICK = float(os.environ.get("FOOTPRINT_TICK", "50"))
+# Row height. "auto" sizes it from what the instrument actually did, so the
+# chart reads the same on a $77,000 future and a $0.60 alt without being told
+# which it is. A number here overrides that and is used as given.
+FOOTPRINT_TICK = os.environ.get("FOOTPRINT_TICK", "auto")
+FOOTPRINT_ROWS_TARGET = int(os.environ.get("FOOTPRINT_ROWS_TARGET", "14"))
+# Re-snap only when the ideal row height is this far from the one in use. The
+# grid rescaling under the reader costs more than a slightly wrong row does,
+# and bars either side of a rescale are not comparable.
+TICK_HYSTERESIS = float(os.environ.get("TICK_HYSTERESIS", "1.5"))
+# Trades are stored at their exact price and bucketed into rows only when the
+# chart is drawn, so changing the row height re-buckets the whole history
+# rather than leaving old bars on the old grid. This caps the distinct prices
+# one bar will hold, since that is what the store costs.
+FOOTPRINT_MAX_LEVELS = int(os.environ.get("FOOTPRINT_MAX_LEVELS", "5000"))
+try:
+    FIXED_TICK = float(FOOTPRINT_TICK)
+    if FIXED_TICK <= 0: FIXED_TICK = 0.0
+except ValueError:
+    FIXED_TICK = 0.0    # "auto", or anything unparseable: size it from the data
 # Bars are wide: at 400px twelve of them overlap into unreadable mush, five do
 # not. The browser sends its width with the frame request and the server picks.
 FOOTPRINT_BARS = int(os.environ.get("FOOTPRINT_BARS", "12"))
@@ -148,6 +167,9 @@ class MobileTerminalEngine:
         self._trade_keys = set()
         self._trade_order = deque(maxlen=TRADE_DEDUPE)
         self.logged_trade = False       # the first raw payload goes to the log once
+        # Held row height, keyed by bar count: a phone and a laptop see
+        # different spans, so they must not fight over one value.
+        self.fp_tick = {}
 
         self.opens = deque(maxlen=MAX_HISTORY)
         self.highs = deque(maxlen=MAX_HISTORY)
@@ -329,9 +351,13 @@ def record_trade(ts, price, size, is_buy):
         while len(p.footprint) > FOOTPRINT_BARS + 4:
             p.footprint.popitem(last=False)
 
-    row = round(price // FOOTPRINT_TICK * FOOTPRINT_TICK, 2)
-    level = c["levels"].setdefault(row, [0.0, 0.0])      # [sell, buy]
-    level[1 if is_buy else 0] += size
+    level = c["levels"].get(price)
+    if level is None and len(c["levels"]) < FOOTPRINT_MAX_LEVELS:
+        level = c["levels"][price] = [0.0, 0.0]          # [sell, buy]
+    # Past the cap the level accounting is skipped, but everything below it
+    # still runs: the trade is real and the candle and liveness depend on it.
+    if level is not None:
+        level[1 if is_buy else 0] += size
     c["buy" if is_buy else "sell"] += size
     c["high"] = max(c["high"], price)
     c["low"] = min(c["low"], price)
@@ -664,8 +690,8 @@ def waiting_figure(ws_state, rest_error, ltp_error, height=FOOTPRINT_HEIGHT):
                        font=dict(size=12, color="#787b86", family="ui-monospace, monospace"))
     fig.update_layout(template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
                       height=height, margin=dict(l=8, r=40, t=5, b=5), showlegend=False)
-    fig.update_xaxes(visible=False)
-    fig.update_yaxes(visible=False)
+    fig.update_xaxes(visible=False, fixedrange=True)
+    fig.update_yaxes(visible=False, fixedrange=True)
     return fig
 
 
@@ -723,6 +749,61 @@ def dom_table(bids, asks):
         ])
 
 
+# 1 / 2 / 2.5 / 5 x 10^k. Rows land on prices a person recognises - 25, 50,
+# 250 - rather than on 37.4, which is what span/rows alone would give.
+NICE_TICKS = (1.0, 2.0, 2.5, 5.0, 10.0)
+
+
+def nice_tick(raw):
+    """Snap a raw row height up to the next round number."""
+    if not raw or raw <= 0 or not math.isfinite(raw):
+        return 1.0
+    mag = 10.0 ** math.floor(math.log10(raw))
+    for step in NICE_TICKS:
+        if raw <= step * mag * 1.000001:
+            return step * mag
+    return 10.0 * mag
+
+
+def choose_tick(span, current):
+    """Row height for a price span, holding the previous one where it is close.
+
+    The target is a row count, not a row size: FOOTPRINT_ROWS_TARGET rows are
+    what fits the screen whatever the instrument costs, so the same code reads
+    on a $77,000 future and a $0.60 alt. Without hysteresis the grid would
+    rescale on every ordinary swing in volatility and bars either side of the
+    change would not be comparable, so an established tick is kept until the
+    ideal one is TICK_HYSTERESIS away in either direction.
+    """
+    if span <= 0 or not math.isfinite(span):
+        return current or 1.0
+    raw = span / FOOTPRINT_ROWS_TARGET
+    if not current:
+        return nice_tick(raw)
+    # Compare the UNSNAPPED ideal against what is held. Snapping first would
+    # make the threshold meaningless: two snapped values are already a whole
+    # rung apart, so any drift across a rung boundary would clear any ratio.
+    ratio = max(raw / current, current / raw)
+    return nice_tick(raw) if ratio >= TICK_HYSTERESIS else current
+
+
+def fmt_tick(t):
+    """Row height for the header, without trailing noise on sub-unit ticks."""
+    return f"{t:,.0f}" if t >= 1 else f"{t:g}"
+
+
+def bucket_levels(levels, tick):
+    """Exact traded prices folded into display rows of `tick`."""
+    grid = {}
+    for price, (sell, buy) in levels.items():
+        row = round(math.floor(price / tick) * tick, 8)
+        cell = grid.get(row)
+        if cell is None: cell = grid[row] = [0.0, 0.0]
+        cell[0] += sell
+        cell[1] += buy
+    return grid
+
+
 def fp_num(v):
     """Cell volumes, short. A column is about 70px at phone width, so a pair
     like "1,040 x 1,521" runs past the cell and over the price axis; "1.0k x
@@ -732,7 +813,7 @@ def fp_num(v):
     return f"{v:,.0f}"
 
 
-def footprint_figure(bars, trade_error):
+def footprint_figure(bars, trade_error, tick):
     """Per-bar, per-price-row sell x buy volume, candles drawn over the top.
 
     Reading it. Each cell is `sell x buy` for that price row: volume that hit
@@ -772,11 +853,12 @@ def footprint_figure(bars, trade_error):
 
     keys = sorted(bars)
     labels = [k.tz_convert(DISPLAY_TZ).strftime("%H:%M") for k in keys]
-    rows = sorted({r for k in keys for r in bars[k]["levels"]})
+    grids = {k: bucket_levels(bars[k]["levels"], tick) for k in keys}
+    rows = sorted({r for g in grids.values() for r in g})
 
     xs, ys, zs, texts = [], [], [], []
     for label, k in zip(labels, keys):
-        levels = bars[k]["levels"]
+        levels = grids[k]
         for row in rows:
             sell, buy = levels.get(row, (0.0, 0.0))
             xs.append(label)
@@ -819,12 +901,19 @@ def footprint_figure(bars, trade_error):
                       plot_bgcolor="#131722", height=FOOTPRINT_HEIGHT,
                       margin=dict(l=8, r=40, t=5, b=22), showlegend=False,
                       uirevision="footprint")
-    fig.update_yaxes(side="right", tickfont=dict(size=9), gridcolor="#2a2e39", row=1, col=1)
-    fig.update_yaxes(side="right", tickfont=dict(size=8), gridcolor="#2a2e39", row=2, col=1)
-    fig.update_xaxes(tickfont=dict(size=9), gridcolor="#2a2e39", row=2, col=1)
+    # Dragging a chart on a phone otherwise pans it instead of scrolling the
+    # page, which makes the page hard to move around. fixedrange takes zoom and
+    # pan off both axes, so the touch reaches the page.
+    fig.update_yaxes(side="right", tickfont=dict(size=9), gridcolor="#2a2e39",
+                     fixedrange=True, row=1, col=1)
+    fig.update_yaxes(side="right", tickfont=dict(size=8), gridcolor="#2a2e39",
+                     fixedrange=True, row=2, col=1)
+    fig.update_xaxes(fixedrange=True, row=1, col=1)
+    fig.update_xaxes(tickfont=dict(size=9), gridcolor="#2a2e39",
+                     fixedrange=True, row=2, col=1)
 
     total = sum(bars[k]["buy"] + bars[k]["sell"] for k in keys)
-    head = (f"FOOTPRINT · {FOOTPRINT_BUCKET} · ${FOOTPRINT_TICK:,.0f} rows · "
+    head = (f"FOOTPRINT · {FOOTPRINT_BUCKET} · ${fmt_tick(tick)} rows · "
             f"sell x buy · Δ {deltas[-1]:+,.0f} · vol {total:,.0f}")
     return fig, head
 
@@ -954,7 +1043,9 @@ def health():
                    "fresh": trades_fresh(),
                    "seconds_since_trade": (round(time.time() - mobile_pipeline.last_trade, 1)
                                            if mobile_pipeline.last_trade else None),
-                   "error": mobile_pipeline.trade_error or None},
+                   "error": mobile_pipeline.trade_error or None,
+                   "tick": (FIXED_TICK or None) if FIXED_TICK
+                           else dict(mobile_pipeline.fp_tick)},
         "pid": os.getpid(),
         "threads": sorted(n for n, t in _threads.items() if t.is_alive()),
         "callbacks": mobile_pipeline.callbacks,
@@ -1025,13 +1116,13 @@ def serve_layout():
                  style={"padding": "6px 8px 2px", "fontSize": "11px",
                         "color": "#787b86", "fontFamily": "ui-monospace, monospace"}),
         dcc.Graph(id="footprint-chart", figure=fp_fig,
-                  config={"displayModeBar": False, "scrollZoom": True}),
+                  config={"displayModeBar": False, "scrollZoom": False}),
         html.Div("OFI · 1s steps · price", style={"padding": "8px 8px 2px",
                  "fontSize": "10px", "color": "#787b86",
                  "fontFamily": "ui-monospace, monospace",
                  "borderTop": "1px solid #2a2e39"}),
         dcc.Graph(id="mobile-master-chart", figure=fig,
-                  config={"displayModeBar": False, "scrollZoom": True}),
+                  config={"displayModeBar": False, "scrollZoom": False}),
         html.Div(id="dom-table", children=table, style={"padding": "4px 8px 12px"}),
         dcc.Interval(id="mobile-pulse-clock", interval=REFRESH_RATE_MS, n_intervals=0)
     ]
@@ -1152,7 +1243,17 @@ def _render(n, width=0):
 
     ltp_text, ltp_style, ltp_delta = format_ltp(ltp, prev_ltp)
     table = dom_table(bids, asks)
-    fp_fig, fp_head = footprint_figure(bars, trade_error)
+    # Row height from the visible span, holding the previous one where close.
+    # A number in FOOTPRINT_TICK overrides it and is used exactly as given.
+    if FIXED_TICK:
+        tick = FIXED_TICK
+    else:
+        lows = [b["low"] for b in bars.values()]
+        highs = [b["high"] for b in bars.values()]
+        span = (max(highs) - min(lows)) if bars else 0.0
+        tick = choose_tick(span, mobile_pipeline.fp_tick.get(want))
+        mobile_pipeline.fp_tick[want] = tick
+    fp_fig, fp_head = footprint_figure(bars, trade_error, tick)
 
     if not times:
         return (f"WAITING · {ws_state}", {"color": "#db8c02"},
@@ -1224,19 +1325,19 @@ def _render(n, width=0):
     pad = pd.Timedelta(seconds=1)
     xr = [times[0] - pad, times[-1] + pad]
     fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", showticklabels=False,
-                     range=xr, row=1, col=1)
+                     range=xr, fixedrange=True, row=1, col=1)
     fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", tickfont=dict(size=8),
-                     range=xr, row=2, col=1)
+                     range=xr, fixedrange=True, row=2, col=1)
 
     fig.update_yaxes(
         showgrid=True, gridcolor="#2a2e39",
         side="right", tickfont=dict(size=8),
-        autorange=True, row=1, col=1
+        autorange=True, fixedrange=True, row=1, col=1
     )
     fig.update_yaxes(
         showgrid=True, gridcolor="#2a2e39",
         side="right", tickfont=dict(size=8),
-        autorange=True, row=2, col=1
+        autorange=True, fixedrange=True, row=2, col=1
     )
 
     return (ticker_text, {"color": ticker_color}, fig,
