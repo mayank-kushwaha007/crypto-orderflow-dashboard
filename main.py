@@ -105,6 +105,11 @@ FOOTPRINT_MAX_LEVELS = int(os.environ.get("FOOTPRINT_MAX_LEVELS", "5000"))
 # edges: retune them against your own instrument before trusting a flag.
 FP_IMBALANCE = float(os.environ.get("FP_IMBALANCE", "0.35"))    # |delta|/volume to call a side
 FP_ABSORB_POS = float(os.environ.get("FP_ABSORB_POS", "0.35"))  # close this near the wrong end
+# One bar's range is a real measurement but a bad estimate of the chart's, so
+# below this many bars the row height comes from the price level instead. One
+# bar of a quiet minute gave $2 rows on a $85,000 instrument.
+FP_TICK_MIN_BARS = int(os.environ.get("FP_TICK_MIN_BARS", "3"))
+FP_TICK_SEED = float(os.environ.get("FP_TICK_SEED", "0.0005"))  # of price, per row
 try:
     FIXED_TICK = float(FOOTPRINT_TICK)
     if FIXED_TICK <= 0: FIXED_TICK = 0.0
@@ -194,8 +199,8 @@ def parse_level(level):
     return float(level[0]), float(level[1])
 
 
-def apply_levels(side, levels):
-    book = mobile_pipeline.order_book[side]
+def apply_levels(side, levels, book=None):
+    if book is None: book = mobile_pipeline.order_book[side]
     for level in levels:
         try:
             p, s = parse_level(level)
@@ -467,12 +472,16 @@ def on_message(ws, message):
 
     elif msg_type == "l2_orderbook":
         # Full depth snapshot; Delta names the sides buy/sell on this channel.
+        # Parsed into a scratch book for the same reason as the REST poller: an
+        # empty snapshot must not wipe a working one.
+        bids, asks = {}, {}
+        apply_levels("bids", data.get("buy") or data.get("bids") or [], bids)
+        apply_levels("asks", data.get("sell") or data.get("asks") or [], asks)
+        if not (bids and asks):
+            return
         with mobile_pipeline.lock:
-            mobile_pipeline.order_book["bids"].clear()
-            mobile_pipeline.order_book["asks"].clear()
-
-            apply_levels("bids", data.get("buy") or data.get("bids") or [])
-            apply_levels("asks", data.get("sell") or data.get("asks") or [])
+            mobile_pipeline.order_book["bids"] = bids
+            mobile_pipeline.order_book["asks"] = asks
             update_metrics()
             mobile_pipeline.last_ws_data = time.time()
 
@@ -532,11 +541,20 @@ def poll_rest():
                 payload = json.loads(resp.read().decode())
 
             result = payload.get("result") or {}
+            # Parse into a scratch book first. Clearing the live one and then
+            # finding the response carried no levels left an empty book, and an
+            # empty book makes update_metrics return before it touches
+            # last_update - so the feed went stale with rest_error cleared to ""
+            # and nothing anywhere said why. Raising puts it on the error path,
+            # which backs off, logs, and shows the reason in the ticker.
+            bids, asks = {}, {}
+            apply_levels("bids", result.get("buy") or [], bids)
+            apply_levels("asks", result.get("sell") or [], asks)
+            if not (bids and asks):
+                raise ValueError("no levels in response: %.90s" % json.dumps(payload))
             with mobile_pipeline.lock:
-                mobile_pipeline.order_book["bids"].clear()
-                mobile_pipeline.order_book["asks"].clear()
-                apply_levels("bids", result.get("buy") or [])
-                apply_levels("asks", result.get("sell") or [])
+                mobile_pipeline.order_book["bids"] = bids
+                mobile_pipeline.order_book["asks"] = asks
                 update_metrics()
             mobile_pipeline.rest_error = ""
             delay = REST_INTERVAL
@@ -867,7 +885,15 @@ def fp_num(v):
     return f"{v:,.0f}"
 
 
-def footprint_figure(bars, trade_error, tick):
+def age_text(seconds):
+    """A gap in units a person reads at a glance. "13,247s" does not say
+    "three and a half hours" without arithmetic."""
+    if seconds < 90: return f"{seconds:.0f}s"
+    if seconds < 5400: return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def footprint_figure(bars, trade_error, tick, stale=0.0):
     """Per-bar, per-price-row sell x buy volume, candles drawn over the top.
 
     Reading it. Each cell is `sell x buy` for that price row: volume that hit
@@ -990,6 +1016,12 @@ def footprint_figure(bars, trade_error, tick):
     now = f"⚑ {name} · {why}" if flagged else name
     head = (f"FOOTPRINT · {FOOTPRINT_BUCKET} · ${fmt_tick(tick)} rows · "
             f"sell x buy · Δ {deltas[-1]:+,.0f} · vol {total:,.0f} · {now}")
+    # A stale feed leaves the last bars on screen looking current. Say it here,
+    # on the chart being read, not only in the ticker above it.
+    if stale > STALE_AFTER:
+        head = f"NO TRADES FOR {age_text(stale)} · showing {len(keys)} bar(s) · " + head
+    elif len(keys) < 3:
+        head = f"FILLING · {len(keys)} bar(s) so far · " + head
     return fig, head
 
 
@@ -1384,10 +1416,20 @@ def _render(n, width=0):
     else:
         lows = [b["low"] for b in bars.values()]
         highs = [b["high"] for b in bars.values()]
-        span = (max(highs) - min(lows)) if bars else 0.0
-        tick = choose_tick(span, mobile_pipeline.fp_tick.get(want))
-        mobile_pipeline.fp_tick[want] = tick
-    fp_fig, fp_head = footprint_figure(bars, trade_error, tick)
+        held = mobile_pipeline.fp_tick.get(want)
+        if len(bars) < FP_TICK_MIN_BARS:
+            # Too few bars to measure a range from; size off the price instead
+            # and do not store it, so the first real span still decides.
+            seed = highs[-1] if highs else (mobile_pipeline.trade_price or 0.0)
+            if held: tick = held                    # a real span already decided
+            elif seed > 0: tick = nice_tick(seed * FP_TICK_SEED)
+            else: tick = 1.0
+        else:
+            span = max(highs) - min(lows)
+            tick = choose_tick(span, held)
+            mobile_pipeline.fp_tick[want] = tick
+    stale = (time.time() - mobile_pipeline.last_trade) if mobile_pipeline.last_trade else 0.0
+    fp_fig, fp_head = footprint_figure(bars, trade_error, tick, stale)
 
     if not times:
         return (f"WAITING · {ws_state}", {"color": "#db8c02"},

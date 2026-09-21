@@ -33,6 +33,9 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
   number here overrides it and is used exactly as given. `FOOTPRINT_ROWS_TARGET` (14) is
   what auto aims for, `TICK_HYSTERESIS` (1.5) how far the ideal must drift before the
   grid re-snaps, `FOOTPRINT_MAX_LEVELS` (5000) the distinct prices one bar will hold.
+- `FP_TICK_MIN_BARS` (3) / `FP_TICK_SEED` (0.0005) — below that many bars there is no
+  range worth measuring, so the row height comes from the price level instead. One bar
+  of a quiet minute sized rows at `$2` on an `$84,858` instrument.
 - `FP_IMBALANCE` (0.35) / `FP_ABSORB_POS` (0.35) — thresholds for the per-bar read in
   `read_bar`. Judgement calls, never backtested here; retune per instrument.
 - `FOOTPRINT_HEIGHT` (620) / `OFI_STRIP_HEIGHT` (190) — the footprint is the chart being
@@ -92,6 +95,13 @@ confirmed from the Render logs instead — do not guess at socket URLs.
 - **Liveness must not depend on the component that fails.** The REST poller once
   stood down whenever the socket had "recently" delivered, so a socket that went
   quiet froze the book while the poller judged it healthy.
+- **A parseable response with no levels used to stall the feed in silence.** The
+  poller cleared the book, applied nothing, and set `rest_error = ""`. An empty book
+  makes `update_metrics` return before it touches `last_update`, so the chart went
+  stale for hours with no error in the ticker, in `/health`, or in the logs. Both the
+  poller and the `l2_orderbook` handler now parse into a scratch book and keep the
+  last good one unless both sides come back non-empty. **Never clear the live book
+  before the replacement has parsed.**
 
 ## Conventions
 
@@ -150,6 +160,10 @@ Scroll position is saved to `sessionStorage` and restored by `SCROLL_KEEP`, re-a
 as the graphs render because the page is not full height until then. Both reloads here
 are involuntary — the fallback timer and the stall recovery — and losing the reader's
 place on a phone costs more than the reload buys.
+
+The footprint header says when the feed is dead (`NO TRADES FOR 3.7h · showing 1
+bar(s)`) or still filling. Stale bars otherwise sit there looking current, and the
+count is what tells you a thin chart is a thin feed rather than a layout change.
 
 `read_bar` gives each bar a short label under its time on the axis, and flags the two
 cases worth stopping on with a mark above the bar: absorption (one side clearly the
