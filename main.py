@@ -93,6 +93,11 @@ FOOTPRINT_BARS = int(os.environ.get("FOOTPRINT_BARS", "12"))
 FOOTPRINT_BARS_NARROW = int(os.environ.get("FOOTPRINT_BARS_NARROW", "5"))
 NARROW_PX = int(os.environ.get("NARROW_PX", "600"))
 TRADE_DEDUPE = 4000     # Recent trade keys kept, so a re-poll cannot double count
+# The footprint is the chart being read now, so it gets the height. The OFI
+# panel keeps its shape as a strip: the footprint already draws the candles,
+# so what is left worth seeing there is the OFI bar and whether it agrees.
+FOOTPRINT_HEIGHT = int(os.environ.get("FOOTPRINT_HEIGHT", "620"))
+OFI_STRIP_HEIGHT = int(os.environ.get("OFI_STRIP_HEIGHT", "190"))
 
 class MobileTerminalEngine:
     def __init__(self):
@@ -645,7 +650,7 @@ HEAD = dict(CELL, color="#787b86", fontSize="10px", letterSpacing="0.06em",
             borderBottom="1px solid #2a2e39", textAlign="right")
 
 
-def waiting_figure(ws_state, rest_error, ltp_error):
+def waiting_figure(ws_state, rest_error, ltp_error, height=FOOTPRINT_HEIGHT):
     """Hold the page's shape and say why it is empty, rather than collapsing."""
     live = sum(1 for t in _threads.values() if t.is_alive())
     lines = [f"waiting for market data  ·  pid {os.getpid()}  ·  {live}/{len(WORKERS)} feed threads",
@@ -658,7 +663,7 @@ def waiting_figure(ws_state, rest_error, ltp_error):
                        x=0.5, y=0.5, align="left",
                        font=dict(size=12, color="#787b86", family="ui-monospace, monospace"))
     fig.update_layout(template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
-                      height=540, margin=dict(l=8, r=40, t=5, b=5), showlegend=False)
+                      height=height, margin=dict(l=8, r=40, t=5, b=5), showlegend=False)
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
     return fig
@@ -718,8 +723,42 @@ def dom_table(bids, asks):
         ])
 
 
+def fp_num(v):
+    """Cell volumes, short. A column is about 70px at phone width, so a pair
+    like "1,040 x 1,521" runs past the cell and over the price axis; "1.0k x
+    1.5k" does not."""
+    if v >= 999_500: return f"{v / 1e6:.1f}M"
+    if v >= 1000: return f"{v / 1000:.1f}k"
+    return f"{v:,.0f}"
+
+
 def footprint_figure(bars, trade_error):
     """Per-bar, per-price-row sell x buy volume, candles drawn over the top.
+
+    Reading it. Each cell is `sell x buy` for that price row: volume that hit
+    the bid, then volume that lifted the ask. Green means buyers were the
+    aggressors there, red means sellers. What the chart is for:
+
+    - Absorption. A row with heavy volume where price then refuses to continue
+      is someone large filling against the move. Heavy buying at the top of a
+      bar that closes weak means those buyers were fed; the level above is
+      defended. This is the reason to have a footprint at all, and it is
+      invisible to OFI, which nets it to zero.
+    - Imbalance. Compare a row diagonally against its neighbour, bid to ask:
+      a run of rows imbalanced the same way marks where one side was in
+      control, and those edges tend to matter again on a revisit.
+    - Point of control. The fattest row in a bar is where the volume agreed on
+      value. Price leaving it quickly and not returning is acceptance; price
+      keeping coming back to it is a range.
+    - Delta divergence. The bar under the grid is buy minus sell for the whole
+      bar. Price making a new high while that bar prints lower than the last
+      high means the move is running on thin offers, not on buying.
+    - Exhaustion. A tiny cell at the extreme of a bar - almost all one side,
+      almost no volume - is the aggressor running out, not breaking out.
+
+    None of this is a signal on its own. The footprint says what happened at a
+    price; it does not say what happens next, and a single bar rarely means
+    anything without the level it is trading against.
 
     A Heatmap carries the numbers because it is one trace for the whole grid
     rather than one per cell, and its texttemplate puts the pair inside each
@@ -748,7 +787,7 @@ def footprint_figure(bars, trade_error):
                 continue
             # Imbalance colours the cell: +1 all buying, -1 all selling.
             zs.append((buy - sell) / (buy + sell))
-            texts.append(f"{sell:,.0f} x {buy:,.0f}")
+            texts.append(f"{fp_num(sell)} x {fp_num(buy)}")
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         vertical_spacing=0.02, row_heights=[0.82, 0.18])
@@ -777,7 +816,7 @@ def footprint_figure(bars, trade_error):
     # b=22, not the main chart's 5: the bar times sit on this axis and 5px
     # clips them against whatever is drawn underneath.
     fig.update_layout(template="plotly_dark", paper_bgcolor="#131722",
-                      plot_bgcolor="#131722", height=540,
+                      plot_bgcolor="#131722", height=FOOTPRINT_HEIGHT,
                       margin=dict(l=8, r=40, t=5, b=22), showlegend=False,
                       uirevision="footprint")
     fig.update_yaxes(side="right", tickfont=dict(size=9), gridcolor="#2a2e39", row=1, col=1)
@@ -982,13 +1021,16 @@ def serve_layout():
                           style={"fontSize": "12px", "fontVariantNumeric": "tabular-nums"}),
             ]
         ),
-        dcc.Graph(id="mobile-master-chart", figure=fig,
-                  config={"displayModeBar": False, "scrollZoom": True}),
         html.Div(id="footprint-head", children=fp_head,
-                 style={"padding": "10px 8px 2px", "fontSize": "11px",
-                        "color": "#787b86", "fontFamily": "ui-monospace, monospace",
-                        "borderTop": "1px solid #2a2e39"}),
+                 style={"padding": "6px 8px 2px", "fontSize": "11px",
+                        "color": "#787b86", "fontFamily": "ui-monospace, monospace"}),
         dcc.Graph(id="footprint-chart", figure=fp_fig,
+                  config={"displayModeBar": False, "scrollZoom": True}),
+        html.Div("OFI · 1s steps · price", style={"padding": "8px 8px 2px",
+                 "fontSize": "10px", "color": "#787b86",
+                 "fontFamily": "ui-monospace, monospace",
+                 "borderTop": "1px solid #2a2e39"}),
+        dcc.Graph(id="mobile-master-chart", figure=fig,
                   config={"displayModeBar": False, "scrollZoom": True}),
         html.Div(id="dom-table", children=table, style={"padding": "4px 8px 12px"}),
         dcc.Interval(id="mobile-pulse-clock", interval=REFRESH_RATE_MS, n_intervals=0)
@@ -1063,7 +1105,7 @@ def _safe_render(n, width=0):
         print(f"[RENDER ERROR] {type(exc).__name__}: {exc}", flush=True)
         msg = f"RENDER ERROR · {type(exc).__name__}: {exc}"[:140]
         return (msg, {"color": "#f23645", "fontSize": "11px"},
-                waiting_figure(msg, "", ""), "—",
+                waiting_figure(msg, "", "", OFI_STRIP_HEIGHT), "—",
                 {"fontSize": "28px", "fontWeight": "bold", "color": "#787b86"}, "", None,
                 waiting_figure(msg, "", ""), "FOOTPRINT · unavailable")
 
@@ -1114,7 +1156,7 @@ def _render(n, width=0):
 
     if not times:
         return (f"WAITING · {ws_state}", {"color": "#db8c02"},
-                waiting_figure(ws_state, rest_error, ltp_error),
+                waiting_figure(ws_state, rest_error, ltp_error, OFI_STRIP_HEIGHT),
                 ltp_text, ltp_style, ltp_delta, table, fp_fig, fp_head)
 
     last_price = cl[-1]
@@ -1130,7 +1172,7 @@ def _render(n, width=0):
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
-        vertical_spacing=0.03, row_heights=[0.80, 0.20]
+        vertical_spacing=0.04, row_heights=[0.62, 0.38]
     )
 
     fig.add_trace(go.Candlestick(
@@ -1173,8 +1215,8 @@ def _render(n, width=0):
         paper_bgcolor="#131722",
         plot_bgcolor="#131722",
         xaxis_rangeslider_visible=False,
-        height=540,
-        margin=dict(l=8, r=40, t=5, b=5),
+        height=OFI_STRIP_HEIGHT,
+        margin=dict(l=8, r=40, t=5, b=18),
         showlegend=False,
         uirevision='constant'
     )
@@ -1183,12 +1225,12 @@ def _render(n, width=0):
     xr = [times[0] - pad, times[-1] + pad]
     fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", showticklabels=False,
                      range=xr, row=1, col=1)
-    fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", tickfont=dict(size=10),
+    fig.update_xaxes(showgrid=True, gridcolor="#2a2e39", tickfont=dict(size=8),
                      range=xr, row=2, col=1)
 
     fig.update_yaxes(
         showgrid=True, gridcolor="#2a2e39",
-        side="right", tickfont=dict(size=10),
+        side="right", tickfont=dict(size=8),
         autorange=True, row=1, col=1
     )
     fig.update_yaxes(
