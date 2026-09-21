@@ -23,9 +23,14 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
   capped at 10s, and `CALLBACK_FRESH` is two intervals — shorter than one interval and
   `callbacks_arriving()` flaps between ticks, re-arming the reload tag on a page that is
   updating perfectly well.
-- `FOOTPRINT_BUCKET` / `FOOTPRINT_TICK` — footprint bar period and price row height,
-  default `5min` and `50`. `FOOTPRINT_BARS` (12) and `FOOTPRINT_BARS_NARROW` (5) are the
-  bar counts above and below `NARROW_PX` (600) of viewport width.
+- `FOOTPRINT_BUCKET` — footprint bar period, default `5min`. `FOOTPRINT_BARS` (12) and
+  `FOOTPRINT_BARS_NARROW` (5) are the bar counts above and below `NARROW_PX` (600) of
+  viewport width.
+- `FOOTPRINT_TICK` — price row height, default `auto`: sized from what the instrument
+  actually did, so the chart reads the same on a $77,000 future and a $0.60 alt. A
+  number here overrides it and is used exactly as given. `FOOTPRINT_ROWS_TARGET` (14) is
+  what auto aims for, `TICK_HYSTERESIS` (1.5) how far the ideal must drift before the
+  grid re-snaps, `FOOTPRINT_MAX_LEVELS` (5000) the distinct prices one bar will hold.
 - `FOOTPRINT_HEIGHT` (620) / `OFI_STRIP_HEIGHT` (190) — the footprint is the chart being
   read, so it is first and tall; the OFI panel sits under it as a strip. The footprint
   already draws the candles, so the strip is there for the OFI bar and whether it agrees.
@@ -118,6 +123,23 @@ otherwise, so the chart keeps drawing when the trade feed is the component that 
 `footprint_figure`'s docstring carries the note on what to infer from the chart —
 absorption, imbalance, point of control, delta divergence, exhaustion. Keep it there;
 it is the part a reader of this code most needs and least gets from the code itself.
+
+**Levels are stored at the exact traded price and bucketed into rows only when the
+chart is drawn.** Bucketing at ingest would bake the row height into the history, so a
+tick change would strand old bars on the old grid; `bucket_levels` at draw time
+re-buckets everything at once. Cost is the distinct prices a bar holds, capped by
+`FOOTPRINT_MAX_LEVELS` — past the cap level accounting is skipped but the rest of
+`record_trade` still runs, because the candle and `trades_fresh()` depend on it.
+
+`choose_tick` compares the **unsnapped** ideal row height against the one in use.
+Snapping first makes the threshold meaningless: two snapped values are already a whole
+rung apart, so any drift over a rung boundary clears any ratio. The held tick is kept
+per bar count, since a phone and a laptop see different spans and must not fight over
+one value.
+
+Both charts have `fixedrange=True` on every axis and `scrollZoom: False`. On a phone a
+drag otherwise pans the chart instead of scrolling the page, which makes the page hard
+to move around.
 
 The footprint is a `go.Heatmap` — one trace for the whole grid, with `texttemplate`
 putting `sell x buy` inside each cell, shortened by `fp_num` to `1.5k` above a thousand
