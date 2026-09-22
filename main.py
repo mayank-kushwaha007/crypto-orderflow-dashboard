@@ -121,6 +121,11 @@ SIGNAL_HORIZONS = [int(x) for x in
 # scan says so rather than reporting a number that invites belief.
 SIGNAL_MIN_N = int(os.environ.get("SIGNAL_MIN_N", "30"))
 FP_RECORD_EVERY = int(os.environ.get("FP_RECORD_EVERY", "20"))  # write sweep
+# The two status lamps. A bar is only written once its minute closes, and the
+# sweep runs every FP_RECORD_EVERY, so writes land about once a minute: three
+# minutes of silence is a real fault, not a quiet patch.
+FEED_OK_S = int(os.environ.get("FEED_OK_S", "60"))
+REC_OK_S = int(os.environ.get("REC_OK_S", "180"))
 FP_MINUTE_KEEP = int(os.environ.get("FP_MINUTE_KEEP", "240"))   # 4h of 1m bars
 FP_TICK_MIN_BARS = int(os.environ.get("FP_TICK_MIN_BARS", "3"))
 FP_TICK_SEED = float(os.environ.get("FP_TICK_SEED", "0.0005"))  # of price, per row
@@ -1064,6 +1069,60 @@ def fp_num(v):
     return f"{v:,.0f}"
 
 
+LAMP_GREEN, LAMP_RED, LAMP_GREY = "#089981", "#f23645", "#787b86"
+
+
+def lamp(colour, label, detail):
+    """One status lamp: a dot, a name, and what it is actually reporting."""
+    return html.Span(style={"display": "inline-flex", "alignItems": "center",
+                            "gap": "5px", "marginRight": "14px"}, children=[
+        html.Span("●", style={"color": colour, "fontSize": "13px", "lineHeight": "1"}),
+        html.Span(label, style={"color": "#d1d4dc", "fontSize": "10px",
+                                "letterSpacing": "0.06em"}),
+        html.Span(detail, style={"color": "#787b86", "fontSize": "10px",
+                                 "fontFamily": "ui-monospace, monospace"}),
+    ])
+
+
+def status_lights():
+    """Is data arriving, and is it being stored. Two questions, two lamps.
+
+    Green is only ever "working now": a lamp that stays green while nothing
+    happens is worse than no lamp. Grey separates "switched off" from "broken",
+    since an unset DATABASE_URL is a supported mode and not a fault, and a
+    recorder with no feed to record is the feed's fault, not its own.
+    """
+    p = mobile_pipeline
+    now = time.time()
+
+    trade_age = (now - p.last_trade) if p.last_trade else None
+    live = trade_age is not None and trade_age < FEED_OK_S
+    if live:
+        feed = lamp(LAMP_GREEN, "STREAM", f"{trade_age:.0f}s · {p.trades_seen:,} trades")
+    elif trade_age is None:
+        feed = lamp(LAMP_RED, "STREAM", "no trades yet")
+    else:
+        feed = lamp(LAMP_RED, "STREAM", f"stalled {age_text(trade_age)}")
+
+    pending = sum(1 for b in p.fp_minute.values() if not b["saved"])
+    write_age = (now - store.fp_last_ok) if store.fp_last_ok else None
+    if not store.enabled:
+        rec = lamp(LAMP_GREY, "REC", "off · DATABASE_URL unset")
+    elif store.error:
+        rec = lamp(LAMP_RED, "REC", store.error[:38])
+    elif write_age is None:
+        # Nothing written yet. Only a fault if there has been data to write.
+        rec = (lamp(LAMP_RED, "REC", f"nothing written, {pending} waiting")
+               if live and pending > 1 else lamp(LAMP_GREY, "REC", "waiting for a full minute"))
+    elif write_age > REC_OK_S and live:
+        rec = lamp(LAMP_RED, "REC", f"stalled {age_text(write_age)} · {pending} waiting")
+    elif not live:
+        rec = lamp(LAMP_GREY, "REC", f"idle · {store.fp_written:,} bars")
+    else:
+        rec = lamp(LAMP_GREEN, "REC", f"{age_text(write_age)} ago · {store.fp_written:,} bars")
+    return feed, rec
+
+
 def age_text(seconds):
     """A gap in units a person reads at a glance. "13,247s" does not say
     "three and a half hours" without arithmetic."""
@@ -1314,7 +1373,7 @@ def api_frame():
     except (TypeError, ValueError):
         width = 0
     (ticker, ticker_style, fig, ltp, ltp_style, delta, table,
-     fp_fig, fp_head) = _safe_render(0, width)
+     fp_fig, fp_head, feed_lamp, rec_lamp) = _safe_render(0, width)
     # The template is ~8KB, static, and already established by the first render.
     fig_json = fig.to_plotly_json()
     fig_json.get("layout", {}).pop("template", None)
@@ -1332,6 +1391,8 @@ def api_frame():
         "table": table,
         "footprint": fp_json,
         "footprint_head": fp_head,
+        "lamp_feed": feed_lamp,
+        "lamp_rec": rec_lamp,
     }
     # PlotlyJSONEncoder recurses into nested components, which is what the table
     # needs. to_plotly_json() converts only the outermost one.
@@ -1442,7 +1503,7 @@ def serve_layout():
     callback is not reaching the browser.
     """
     (ticker, ticker_style, fig, ltp, ltp_style, delta, table,
-     fp_fig, fp_head) = _safe_render(0)
+     fp_fig, fp_head, feed_lamp, rec_lamp) = _safe_render(0)
 
     return html.Div(
     style={"backgroundColor": "#131722", "color": "#d1d4dc", "fontFamily": "sans-serif", "padding": "5px"},
@@ -1460,6 +1521,9 @@ def serve_layout():
                          style=dict(ticker_style, fontWeight="bold"))
             ]
         ),
+        html.Div(style={"padding": "6px 8px 3px", "borderBottom": "1px solid #2a2e39"},
+                 children=[html.Span(id="lamp-feed", children=feed_lamp),
+                           html.Span(id="lamp-rec", children=rec_lamp)]),
         html.Div(
             style={"display": "flex", "alignItems": "baseline", "gap": "10px",
                    "padding": "10px 8px 6px"},
@@ -1502,7 +1566,7 @@ def serve_layout():
 app.clientside_callback(
     """
     function(n) {
-        var blank = Array(10).fill(window.dash_clientside.no_update);
+        var blank = Array(12).fill(window.dash_clientside.no_update);
 
         // One request in flight at a time. The interval fires whether or not
         // the last frame arrived, so on a slow link requests otherwise pile up
@@ -1535,7 +1599,7 @@ app.clientside_callback(
                 }
                 return [d.ticker, d.ticker_style, d.figure,
                         d.ltp, d.ltp_style, d.ltp_delta, d.table, d.clock,
-                        d.footprint, d.footprint_head];
+                        d.footprint, d.footprint_head, d.lamp_feed, d.lamp_rec];
             })
             .catch(function () {
                 clearTimeout(timer);
@@ -1557,7 +1621,9 @@ app.clientside_callback(
      Output("dom-table", "children"),
      Output("frame-clock", "children"),
      Output("footprint-chart", "figure"),
-     Output("footprint-head", "children")],
+     Output("footprint-head", "children"),
+     Output("lamp-feed", "children"),
+     Output("lamp-rec", "children")],
     [Input("mobile-pulse-clock", "n_intervals")],
 )
 
@@ -1574,7 +1640,9 @@ def _safe_render(n, width=0):
         return (msg, {"color": "#f23645", "fontSize": "11px"},
                 waiting_figure(msg, "", "", OFI_STRIP_HEIGHT), "—",
                 {"fontSize": "28px", "fontWeight": "bold", "color": "#787b86"}, "", None,
-                waiting_figure(msg, "", ""), "FOOTPRINT · unavailable")
+                waiting_figure(msg, "", ""), "FOOTPRINT · unavailable",
+                lamp(LAMP_RED, "STREAM", "render error"),
+                lamp(LAMP_RED, "REC", "render error"))
 
 
 def _render(n, width=0):
@@ -1640,11 +1708,13 @@ def _render(n, width=0):
             mobile_pipeline.fp_tick[want] = tick
     stale = (time.time() - mobile_pipeline.last_trade) if mobile_pipeline.last_trade else 0.0
     fp_fig, fp_head = footprint_figure(bars, trade_error, tick, stale)
+    feed_lamp, rec_lamp = status_lights()
 
     if not times:
         return (f"WAITING · {ws_state}", {"color": "#db8c02"},
                 waiting_figure(ws_state, rest_error, ltp_error, OFI_STRIP_HEIGHT),
-                ltp_text, ltp_style, ltp_delta, table, fp_fig, fp_head)
+                ltp_text, ltp_style, ltp_delta, table, fp_fig, fp_head,
+                feed_lamp, rec_lamp)
 
     last_price = cl[-1]
     ticker_color = "#089981" if ofi_steps_list[-1] >= 0 else "#f23645"
@@ -1728,7 +1798,8 @@ def _render(n, width=0):
     )
 
     return (ticker_text, {"color": ticker_color}, fig,
-            ltp_text, ltp_style, ltp_delta, table, fp_fig, fp_head)
+            ltp_text, ltp_style, ltp_delta, table, fp_fig, fp_head,
+            feed_lamp, rec_lamp)
 
 # Assigned after the callback, not beside serve_layout: Dash evaluates the
 # callable immediately and it renders through _safe_render above.

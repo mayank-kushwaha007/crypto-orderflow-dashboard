@@ -36,6 +36,9 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
 - `SIGNAL_EVERY` (3600) / `SIGNAL_BUCKET` (`15min`) / `SIGNAL_LOOKBACK_H` (48) /
   `SIGNAL_HORIZONS` (`15,60`) / `SIGNAL_MIN_N` (30) — the hourly scan. `FP_RECORD_EVERY`
   (20) is the write sweep, `FP_MINUTE_KEEP` (240) the 1m bars held in memory.
+- `FEED_OK_S` (60) / `REC_OK_S` (180) — how stale each status lamp tolerates. A bar is
+  written only once its minute closes and the sweep runs every `FP_RECORD_EVERY`, so
+  writes land about once a minute; three minutes of silence is a fault, not a lull.
 - `FP_TICK_MIN_BARS` (3) / `FP_TICK_SEED` (0.0005) — below that many bars there is no
   range worth measuring, so the row height comes from the price level instead. One bar
   of a quiet minute sized rows at `$2` on an `$84,858` instrument.
@@ -213,6 +216,25 @@ invites belief, and belief is what this is meant to withhold until it is earned.
 
 Both workers retire themselves when `DATABASE_URL` is unset, and every storage call is
 a clean no-op, so the live chart is unchanged.
+
+## The two status lamps
+
+`status_lights()` answers two questions the dashboard could not previously answer at a
+glance: **is data arriving**, and **is it being stored**. They sit on their own row
+rather than in the header, which already collides at 400px.
+
+Green means working *now*, never "was configured correctly once" — a lamp that stays
+green while nothing happens is worse than no lamp. **Grey separates off from broken**,
+and both cases matter:
+
+- `DATABASE_URL` unset is a supported mode, not a fault, so REC is grey, not red.
+- A recorder with no feed to record is the feed's fault, so REC goes grey and idle
+  while STREAM goes red. Two red lamps for one failure would hide which one broke.
+
+REC is red only when recording is enabled and genuinely failing: a storage error,
+writes stalled past `REC_OK_S` while trades are still flowing, or bars waiting with
+nothing ever written. Every one of those eight states is asserted in the scratchpad
+lamp test, including the 3.7h outage that prompted them.
 
 ## OFI semantics
 
