@@ -180,6 +180,7 @@ class Storage:
         self.written = 0
         self.dropped = 0
         self.fp_written = 0
+        self.fp_last_ok = 0.0           # wall clock of the last successful write
         self.signals_found = 0
         self._q = queue.Queue(maxsize=QUEUE_MAX)
         self._conn = None
@@ -291,6 +292,7 @@ class Storage:
                                         bar["low"], bar["close"], bar["buy"],
                                         bar["sell"], levels_json))
             self.fp_written += 1
+            self.fp_last_ok = time.time()
             return True
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"[:120]
