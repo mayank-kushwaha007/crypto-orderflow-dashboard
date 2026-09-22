@@ -33,6 +33,9 @@ fed by Delta Exchange's public `l2_updates` websocket channel. Deployed on Rende
   number here overrides it and is used exactly as given. `FOOTPRINT_ROWS_TARGET` (14) is
   what auto aims for, `TICK_HYSTERESIS` (1.5) how far the ideal must drift before the
   grid re-snaps, `FOOTPRINT_MAX_LEVELS` (5000) the distinct prices one bar will hold.
+- `SIGNAL_EVERY` (3600) / `SIGNAL_BUCKET` (`15min`) / `SIGNAL_LOOKBACK_H` (48) /
+  `SIGNAL_HORIZONS` (`15,60`) / `SIGNAL_MIN_N` (30) — the hourly scan. `FP_RECORD_EVERY`
+  (20) is the write sweep, `FP_MINUTE_KEEP` (240) the 1m bars held in memory.
 - `FP_TICK_MIN_BARS` (3) / `FP_TICK_SEED` (0.0005) — below that many bars there is no
   range worth measuring, so the row height comes from the price level instead. One bar
   of a quiet minute sized rows at `$2` on an `$84,858` instrument.
@@ -178,6 +181,38 @@ because a column is ~70px at phone width and a full-width pair runs over the pri
 cannot share it and the bodies and wicks are `go.Scatter` segments. This is the
 arrangement the public OrderflowChart project uses, for the same reason. Its bottom
 margin is 22px, not the main chart's 5, or the bar times clip.
+
+## Recording and the signal scan
+
+Footprints are recorded at **1 minute**, whatever `FOOTPRINT_BUCKET` displays. The
+display bucket is a display choice; what is stored must not be. 1m rolls up to
+3/5/15/30/60 **exactly** — `merge_bars` sums levels per price, maxes the high, mins the
+low, takes the first open and last close, and every one of those is additive or
+associative, so a 15m bar merged from 15 stored 1m bars is the same bar as one built
+from the trades. That is proven in the scratchpad rollup test, not assumed. Aggregation
+is one-way: nothing recovers a finer bucket than the one stored.
+
+Levels are stored as JSONB keyed by the **exact traded price**. Pre-bucketing to
+display rows would cap how fine any later analysis could go. One row per bar rather
+than one per level: measured at ~7MB/day against ~25MB/day.
+
+`record_minutes` writes completed bars on a sweep, never on the ingest path —
+`record_trade` holds the lock and a slow database must never stall the feed. The newest
+bar is left alone because it is still open, and a failed write keeps `saved=False` for
+the next sweep.
+
+`scan_signals` runs every `SIGNAL_EVERY`, rolls the stored minutes up to
+`SIGNAL_BUCKET`, writes a row for each flagged bar, then resolves rows old enough to
+have an answer against the price that actually came. **What accumulates is a forward
+test**: the outcome was not known when the row was written. Scanning stored history for
+whichever rule looks best would fit the noise, and on one instrument over a few days it
+would always find something. `fwd_move` is in basis points, signed so positive means
+the read was right. Below `SIGNAL_MIN_N` resolved occurrences the scan reports
+`too few (n/N)` instead of a hit rate. **Keep it that way** — the number is what
+invites belief, and belief is what this is meant to withhold until it is earned.
+
+Both workers retire themselves when `DATABASE_URL` is unset, and every storage call is
+a clean no-op, so the live chart is unchanged.
 
 ## OFI semantics
 

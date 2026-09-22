@@ -108,6 +108,20 @@ FP_ABSORB_POS = float(os.environ.get("FP_ABSORB_POS", "0.35"))  # close this nea
 # One bar's range is a real measurement but a bad estimate of the chart's, so
 # below this many bars the row height comes from the price level instead. One
 # bar of a quiet minute gave $2 rows on a $85,000 instrument.
+# Recording and the signal scan. 1m is the finest base worth keeping and rolls
+# up to 3/5/15/30/60 exactly; storing 5m would lock out everything below it.
+FP_RECORD_BUCKET = "1min"
+SIGNAL_EVERY = int(os.environ.get("SIGNAL_EVERY", "3600"))      # scan cadence
+SIGNAL_BUCKET = os.environ.get("SIGNAL_BUCKET", "15min")        # bars scanned
+SIGNAL_LOOKBACK_H = int(os.environ.get("SIGNAL_LOOKBACK_H", "48"))
+# Forward horizons measured after each signal, in minutes.
+SIGNAL_HORIZONS = [int(x) for x in
+                   os.environ.get("SIGNAL_HORIZONS", "15,60").split(",") if x.strip()]
+# Below this many resolved occurrences a hit rate is not a hit rate, and the
+# scan says so rather than reporting a number that invites belief.
+SIGNAL_MIN_N = int(os.environ.get("SIGNAL_MIN_N", "30"))
+FP_RECORD_EVERY = int(os.environ.get("FP_RECORD_EVERY", "20"))  # write sweep
+FP_MINUTE_KEEP = int(os.environ.get("FP_MINUTE_KEEP", "240"))   # 4h of 1m bars
 FP_TICK_MIN_BARS = int(os.environ.get("FP_TICK_MIN_BARS", "3"))
 FP_TICK_SEED = float(os.environ.get("FP_TICK_SEED", "0.0005"))  # of price, per row
 try:
@@ -179,6 +193,13 @@ class MobileTerminalEngine:
         # Held row height, keyed by bar count: a phone and a laptop see
         # different spans, so they must not fight over one value.
         self.fp_tick = {}
+        # 1m bars kept alongside the display bars purely to be recorded. The
+        # display bucket is a display choice; what is stored must not be.
+        self.fp_minute = OrderedDict()
+        self.fp_recorded = 0
+        self.last_scan = 0.0
+        self.scan_error = ""
+        self.scan_summary = []
 
         self.opens = deque(maxlen=MAX_HISTORY)
         self.highs = deque(maxlen=MAX_HISTORY)
@@ -346,19 +367,15 @@ def parse_trade(t):
     return ts, price, size, is_buy
 
 
-def record_trade(ts, price, size, is_buy):
-    """Fold one trade into the footprint and into the live candle. Lock held."""
-    p = mobile_pipeline
-    bar = ts.floor(FOOTPRINT_BUCKET)
-    c = p.footprint.get(bar)
+def fold_bar(bars, key, price, size, is_buy, keep):
+    """Fold one trade into the bar at `key`, evicting past `keep` bars."""
+    c = bars.get(key)
     if c is None:
         c = {"levels": {}, "open": price, "high": price, "low": price,
-             "close": price, "buy": 0.0, "sell": 0.0}
-        p.footprint[bar] = c
-        # Keep a little more than the widest view asks for, so switching to a
-        # laptop does not show a chart that has to refill.
-        while len(p.footprint) > FOOTPRINT_BARS + 4:
-            p.footprint.popitem(last=False)
+             "close": price, "buy": 0.0, "sell": 0.0, "saved": False}
+        bars[key] = c
+        while len(bars) > keep:
+            bars.popitem(last=False)
 
     level = c["levels"].get(price)
     if level is None and len(c["levels"]) < FOOTPRINT_MAX_LEVELS:
@@ -371,6 +388,38 @@ def record_trade(ts, price, size, is_buy):
     c["high"] = max(c["high"], price)
     c["low"] = min(c["low"], price)
     c["close"] = price
+    return c
+
+
+def merge_bars(bars):
+    """Several bars as one. Every field of a footprint is additive or
+    associative - levels sum per price, high is a max, low a min, open the
+    first, close the last - so this is exact: a 15m bar merged from 15 stored
+    1m bars is the same bar as one built from the trades directly."""
+    keys = sorted(bars)
+    out = {"levels": {}, "open": bars[keys[0]]["open"], "close": bars[keys[-1]]["close"],
+           "high": max(bars[k]["high"] for k in keys),
+           "low": min(bars[k]["low"] for k in keys),
+           "buy": sum(bars[k]["buy"] for k in keys),
+           "sell": sum(bars[k]["sell"] for k in keys)}
+    for k in keys:
+        for price, (sell, buy) in bars[k]["levels"].items():
+            cell = out["levels"].get(price)
+            if cell is None: cell = out["levels"][price] = [0.0, 0.0]
+            cell[0] += sell
+            cell[1] += buy
+    return out
+
+
+def record_trade(ts, price, size, is_buy):
+    """Fold one trade into the footprint and into the live candle. Lock held."""
+    p = mobile_pipeline
+    # The display bucket is a display choice; what gets stored must not be, so
+    # a 1m copy is kept alongside it for the recorder to write.
+    fold_bar(p.footprint, ts.floor(FOOTPRINT_BUCKET), price, size, is_buy,
+             FOOTPRINT_BARS + 4)
+    fold_bar(p.fp_minute, ts.floor(FP_RECORD_BUCKET), price, size, is_buy,
+             FP_MINUTE_KEEP)
 
     p.trade_price = price
     p.last_trade = time.time()
@@ -607,6 +656,135 @@ def ws_forever():
         time.sleep(5)
 
 
+def record_minutes():
+    """Write completed 1m footprint bars to Postgres.
+
+    Deliberately off the ingest path: record_trade holds the lock, and a slow
+    or unreachable database must never stall the feed. The newest bar is left
+    alone because it is still open; a bar that fails to write keeps saved=False
+    and is retried on the next sweep.
+    """
+    if not store.enabled:
+        _retired.add("recorder")
+        print("[FP] DATABASE_URL unset; footprint recording disabled", flush=True)
+        return
+    while True:
+        try:
+            time.sleep(FP_RECORD_EVERY)
+            with mobile_pipeline.lock:
+                keys = sorted(mobile_pipeline.fp_minute)
+                todo = [(k, dict(mobile_pipeline.fp_minute[k]),
+                         dict(mobile_pipeline.fp_minute[k]["levels"]))
+                        for k in keys[:-1] if not mobile_pipeline.fp_minute[k]["saved"]]
+            for key, bar, levels in todo:
+                blob = json.dumps({repr(px): v for px, v in levels.items()})
+                if store.record_footprint(key.to_pydatetime(), bar, blob):
+                    with mobile_pipeline.lock:
+                        if key in mobile_pipeline.fp_minute:
+                            mobile_pipeline.fp_minute[key]["saved"] = True
+                    mobile_pipeline.fp_recorded += 1
+            if todo:
+                print(f"[FP] recorded {len(todo)} minute bar(s), "
+                      f"{mobile_pipeline.fp_recorded} total", flush=True)
+        except Exception as exc:
+            print(f"[FP ERROR] {type(exc).__name__}: {exc}", flush=True)
+
+
+def signal_dir(kind):
+    """+1 where the read argues price should rise, -1 where it should fall."""
+    return 1 if kind.endswith("↑") else -1
+
+
+def load_signal_bars():
+    """Stored 1m bars rolled up to SIGNAL_BUCKET, oldest first."""
+    since = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=SIGNAL_LOOKBACK_H)
+    rows = store.load_footprint(since.to_pydatetime())
+    minute = {}
+    for ts, o, h, l, c, buy, sell, levels in rows:
+        minute[pd.Timestamp(ts).tz_convert("UTC")] = {
+            "open": o, "high": h, "low": l, "close": c, "buy": buy, "sell": sell,
+            "levels": {float(k): list(v) for k, v in (levels or {}).items()}}
+    grouped = {}
+    for k in sorted(minute):
+        grouped.setdefault(k.floor(SIGNAL_BUCKET), {})[k] = minute[k]
+    return {b: merge_bars(g) for b, g in grouped.items()}, len(minute)
+
+
+def scan_signals():
+    """Every SIGNAL_EVERY: look for flagged bars, then find out what happened.
+
+    A signal row is written when the bar closes and resolved later against the
+    price that actually came, so what accumulates is a FORWARD test - the
+    outcome was not known when the row was created. Scanning stored history for
+    whichever rule looks best would fit the noise instead, and on one
+    instrument over a few days it would always find something.
+
+    This measures. It does not certify anything as tradeable, and below
+    SIGNAL_MIN_N resolved occurrences it says so rather than printing a hit
+    rate that invites belief.
+    """
+    if not store.enabled:
+        _retired.add("signals")
+        print("[SCAN] DATABASE_URL unset; signal scan disabled", flush=True)
+        return
+    while True:
+        try:
+            time.sleep(SIGNAL_EVERY)
+            bars, n_minutes = load_signal_bars()
+            keys = sorted(bars)
+            found = 0
+            # The newest bar is still open, so it is not judged.
+            for i, k in enumerate(keys[:-1]):
+                prev = bars[keys[i - 1]] if i else None
+                kind, flagged, _why = read_bar(bars[k], prev)
+                if not flagged:
+                    continue
+                b = bars[k]
+                for h in SIGNAL_HORIZONS:
+                    if store.record_signal(k.to_pydatetime(), kind, h, b["close"],
+                                           b["buy"] - b["sell"], b["buy"] + b["sell"]):
+                        found += 1
+
+            # Resolve anything old enough to have an answer.
+            now = pd.Timestamp.now(tz="UTC")
+            resolved = 0
+            for ts, kind, h, price in store.open_signals(
+                    (now - pd.Timedelta(minutes=max(SIGNAL_HORIZONS))).to_pydatetime()):
+                target = pd.Timestamp(ts).tz_convert("UTC") + pd.Timedelta(minutes=h)
+                if target > now:
+                    continue
+                fwd = store.price_at(target.to_pydatetime())
+                if fwd is None or not price:
+                    continue
+                # Signed so that positive always means the read was right.
+                move = signal_dir(kind) * (fwd - price) / price * 10000.0
+                store.resolve_signal(pd.Timestamp(ts).to_pydatetime(), kind, h, fwd, move)
+                resolved += 1
+
+            summary = []
+            for kind, h, n, mean, sd, hit in store.signal_stats():
+                enough = n >= SIGNAL_MIN_N
+                summary.append({"kind": kind, "horizon_m": h, "n": n,
+                                "mean_move_bps": round(mean or 0.0, 2),
+                                "sd_bps": round(sd or 0.0, 2),
+                                "hit_rate": round(hit or 0.0, 3),
+                                "verdict": "measured" if enough
+                                           else f"too few ({n}/{SIGNAL_MIN_N})"})
+            mobile_pipeline.scan_summary = summary
+            mobile_pipeline.last_scan = time.time()
+            mobile_pipeline.scan_error = ""
+            store.signals_found += found
+            print(f"[SCAN] {n_minutes} minute bars -> {len(keys)} {SIGNAL_BUCKET} bars, "
+                  f"{found} new signal rows, {resolved} resolved", flush=True)
+            for r in summary:
+                print("[SCAN]   %-5s %3dm  n=%-4d mean %+7.2fbp  hit %.0f%%  %s"
+                      % (r["kind"], r["horizon_m"], r["n"], r["mean_move_bps"],
+                         r["hit_rate"] * 100, r["verdict"]), flush=True)
+        except Exception as exc:
+            mobile_pipeline.scan_error = f"{type(exc).__name__}: {exc}"[:120]
+            print(f"[SCAN ERROR] {type(exc).__name__}: {exc}", flush=True)
+
+
 def keepalive():
     """Request our own public URL so Render sees inbound traffic and stays up.
 
@@ -630,7 +808,8 @@ def keepalive():
 
 
 WORKERS = (("ws", ws_forever), ("watchdog", watchdog), ("rest", poll_rest),
-           ("trades", poll_trades), ("keepalive", keepalive))
+           ("trades", poll_trades), ("recorder", record_minutes),
+           ("signals", scan_signals), ("keepalive", keepalive))
 _threads = {}
 _retired = set()        # workers that finished on purpose and must not be respawned
 _threads_lock = threading.Lock()
@@ -1160,6 +1339,30 @@ def api_frame():
         "Content-Type": "application/json", "Cache-Control": "no-store"}
 
 
+@server.route("/signals")
+def signals():
+    """What the scan has measured so far. Sample size first, deliberately:
+    a hit rate on nine occurrences is not a hit rate."""
+    ensure_workers()
+    rows = mobile_pipeline.scan_summary
+    payload = {
+        "symbol": SYMBOL,
+        "bucket": SIGNAL_BUCKET,
+        "horizons_m": SIGNAL_HORIZONS,
+        "min_sample": SIGNAL_MIN_N,
+        "scan_every_s": SIGNAL_EVERY,
+        "last_scan_s_ago": (round(time.time() - mobile_pipeline.last_scan, 1)
+                            if mobile_pipeline.last_scan else None),
+        "scan_error": mobile_pipeline.scan_error or None,
+        "recording": {"enabled": store.enabled, "minute_bars_written": store.fp_written,
+                      "minute_bars_in_memory": len(mobile_pipeline.fp_minute)},
+        "note": ("fwd_move is in basis points, signed so positive means the read was "
+                 "right. Rows below min_sample are not evidence of anything."),
+        "results": rows,
+    }
+    return json.dumps(payload), 200, {"Content-Type": "application/json"}
+
+
 @server.route("/health")
 def health():
     """Cheap liveness probe for an external pinger, and a status readout.
@@ -1203,7 +1406,14 @@ def health():
         "render_error": mobile_pipeline.render_error or None,
         "dash_version": dash.__version__,
         "storage": {"enabled": store.enabled, "written": store.written,
-                    "dropped": store.dropped, "error": store.error or None},
+                    "dropped": store.dropped, "error": store.error or None,
+                    "footprint_bars": store.fp_written,
+                    "minutes_pending": sum(
+                        1 for b in mobile_pipeline.fp_minute.values() if not b["saved"])},
+        "scan": {"last_s_ago": (round(time.time() - mobile_pipeline.last_scan, 1)
+                                if mobile_pipeline.last_scan else None),
+                 "error": mobile_pipeline.scan_error or None,
+                 "rows": len(mobile_pipeline.scan_summary)},
     }
     return json.dumps(payload), 200, {"Content-Type": "application/json"}
 
